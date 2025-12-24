@@ -99,26 +99,39 @@ Nodes connect outbound only; no public IP is required.
 
 ---
 
-### Submit a Docker Job
 
-```bash
-symphony job submit docker \
-  --group gpu \
-  --usage A10,B20 \
-  --image registry.example.com/myapp:1.0 \
-  --env ENV=prod
+## Job Specification (JSON)
+
+### Docker Job Example
+
+```json
+{
+  "type": "docker",
+  "group": "gpu",
+  "usage": "A10,B20",
+  "docker": {
+    "image": "registry.example.com/myapp:1.0",
+    "env": {
+      "ENV": "prod"
+    }
+  }
+}
 ```
 
 ---
 
-### Submit an Exec Job
+### Exec Job Example
 
-```bash
-symphony job submit exec \
-  --group edge-bkk \
-  --usage A5 \
-  --command "/usr/bin/python3" \
-  --arg "main.py"
+```json
+{
+  "type": "exec",
+  "group": "edge-bkk",
+  "usage": "A5",
+  "exec": {
+    "command": "/usr/bin/python3",
+    "args": ["main.py"]
+  }
+}
 ```
 
 ---
@@ -152,6 +165,3 @@ The Conductor exposes a simple HTTP API:
 - `POST /v1/jobs/{id}/cancel`
 - `GET /v1/nodes`
 - `GET /v1/nodes/{id}`
-
-Node–Conductor communication uses a secure persistent channel
-(WebSocket or gRPC over TLS).
