@@ -4,6 +4,27 @@
 
 A central **Conductor** schedules Docker and exec jobs across distributed **Nodes**, balancing workloads using **virtual resource capacities** instead of raw CPU or memory.
 
+⚠️ **Early Stage / Work in Progress**
+
+Symphony is currently in the **design and planning phase**.
+No production-ready code has been released yet.
+
+This repository is public to:
+- document the architecture and ideas early
+- gather feedback
+- allow discussions before implementation
+
+---
+
+## Current Status
+
+- ❌ No stable implementation
+- ❌ No releases
+- ❌ APIs and CLI are **not final**
+- ❌ Breaking changes expected
+
+Everything in this repository should be considered **experimental**.
+
 ---
 
 ## Architecture
