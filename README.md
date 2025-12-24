@@ -100,6 +100,15 @@ Nodes connect outbound only; no public IP is required.
 ---
 
 
+## Submit a Job
+
+Jobs are submitted using a **single command** with a JSON specification.
+
+```bash
+symphony job submit --file job.json
+```
+
+
 ## Job Specification (JSON)
 
 ### Docker Job Example
