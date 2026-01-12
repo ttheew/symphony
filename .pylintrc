@@ -1,0 +1,10 @@
+[MASTER]
+ignore-patterns=.*_pb2\.py,.*_pb2_grpc\.py
+
+[MESSAGES CONTROL]
+disable=
+    too-few-public-methods,
+    duplicate-code
+
+[FORMAT]
+max-line-length=100
