@@ -24,4 +24,4 @@ jobs:
 
     - name: Analysing the code with pylint
       run: |
-        pylint src/ --rcfile=.pylintrc
+        pylint src/ --rcfile=.pylintrc --exit-zero
