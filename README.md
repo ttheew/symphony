@@ -301,8 +301,8 @@ UI location:
 
 - `http://localhost:8000/ui`
 
-![UI screenshot 1](src/symphony/docs/images/ui-1.png)
-![UI screenshot 2](src/symphony/docs/images/ui-2.png)
+![UI screenshot 1](https://raw.githubusercontent.com/ttheew/symphony/refs/heads/main/src/symphony/docs/images/ui-1.png)
+![UI screenshot 2](https://raw.githubusercontent.com/ttheew/symphony/refs/heads/main/src/symphony/docs/images/ui-2.png)
 
 ### Example deployment spec
 

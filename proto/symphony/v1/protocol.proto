@@ -1,0 +1,144 @@
+syntax = "proto3";
+
+package symphony.v1;
+
+service ConductorService {
+  rpc Connect (stream NodeToConductor) returns (stream ConductorToNode);
+}
+
+message CpuStatic {
+  uint32 logical_cores = 1;
+  uint64 max_millicores_total = 2;
+}
+
+message CpuUsage {
+  double total_percent = 1;
+  message CoreUsage {
+    uint32 core_id = 1;
+    double used_percent = 2;
+  }
+  repeated CoreUsage per_core = 2;
+}
+
+message MemoryStatic {
+  uint64 total_bytes = 1;
+}
+
+message MemoryUsage {
+  uint64 used_bytes = 1;
+  uint64 available_bytes = 2;
+
+  double used_percent = 3;
+  uint64 free_bytes = 4;
+  uint64 buffers_bytes = 5;
+  uint64 cached_bytes = 6;
+}
+
+message StorageMountStatic {
+  string mount_point = 1;
+  string fs_type = 2;
+  uint64 total_bytes = 3;
+}
+
+message StorageMountUsage {
+  string mount_point = 1;
+  uint64 used_bytes = 2;
+  uint64 available_bytes = 3;
+  double used_percent = 4;
+}
+
+message GpuStatic {
+  uint32 index = 1;
+  string name = 2;
+  uint64 mem_total_bytes = 3;
+}
+
+message GpuUsage {
+  uint32 index = 1;
+  double util_percent = 2;
+  double mem_util_percent = 3;
+  uint64 mem_used_bytes = 4;
+  uint64 mem_free_bytes = 5;
+
+  int32 temperature_c = 6;
+  double power_w = 7;
+}
+
+message NodeHello {
+  string node_id = 1;
+  repeated string groups = 2;
+
+  map<string, int64> capacities_total = 3;
+
+  CpuStatic cpu = 4;
+  MemoryStatic memory = 5;
+  repeated StorageMountStatic storage_mounts = 6;
+  repeated GpuStatic gpus = 7;
+}
+
+message Heartbeat {
+  string node_id = 1;
+  int64 timestamp_unix_ms = 2;
+
+  map<string, int64> total_capacities_used = 3;
+
+  CpuUsage cpu = 4;
+  MemoryUsage memory = 5;
+  repeated StorageMountUsage storage_mounts = 6;
+  repeated GpuUsage gpus = 7;
+}
+
+message DeploymentStatus {
+  string exec_id = 1;
+  string desired_state = 2;
+  string status = 3;
+
+  int64 pid = 4;
+
+  int64 started_at_ms = 5;
+  int64 stopped_at_ms = 6;
+
+  int32 last_exit_code = 7;
+
+  string restart_policy = 8;
+  int32 max_restarts = 9;
+  int32 restart_window_sec = 10;
+  int32 restart_count_window = 11;
+}
+
+message DeploymentStatusList {
+  repeated DeploymentStatus deployments = 1;
+}
+
+message NodeToConductor {
+  oneof msg {
+    NodeHello hello = 1;
+    Heartbeat heartbeat = 2;
+    DeploymentStatusList deployment_status_list = 3;
+  }
+}
+
+message Ack {
+  string message = 1;
+}
+
+message DeploymentReq {
+  string specification = 1;
+}
+
+message DeploymentUpdate {
+  string deployment_id = 1;
+  oneof msg {
+    string status = 2;
+    string spec = 3;
+    bool trigger_restart = 4;
+  }
+}
+
+message ConductorToNode {
+  oneof msg {
+    Ack ack = 1;
+    DeploymentReq deployment_req = 2;
+    DeploymentUpdate deployment_update = 4;
+  }
+}
