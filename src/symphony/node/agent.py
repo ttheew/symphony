@@ -246,29 +246,14 @@ class NodeAgent:
                     deployment_dict = json.loads(msg.deployment_req.specification)
                     deployment_id = deployment_dict["id"]
                     deployment_status = await self.runner_exec.status(deployment_id)
-                    if deployment_status:
-                        logger.warning(
-                            "Deployment initialisation failed since deployment exists"
-                        )
-                        continue
                     deployment_spec = deployment_dict["specification"]["spec"]
-                    cmd_join = " ".join(deployment_spec["config"]["command"])
-                    cmd_gen = [
-                        "bash",
-                        "-c",
-                        f"exec -a symphony:{deployment_id} {cmd_join}",
-                    ]
+                    if deployment_status:
+                        logger.info("Updating deployment spec on node id={}", deployment_id)
+                    else:
+                        logger.info("Creating deployment on node id={}", deployment_id)
                     await self.runner_exec.add_exec(
                         deployment_id,
-                        {
-                            "cmd": cmd_gen,
-                            "env": deployment_spec["config"]["env"],
-                            "restart_policy": "on-failure",
-                            "max_restarts": 5,
-                            "restart_window_sec": 120,
-                            "log_limit_lines": 200,
-                            "capacity_requests": deployment_spec["capacity_requests"],
-                        },
+                        deployment_spec,
                     )
                     if deployment_dict["desired_state"] == "RUNNING":
                         await self.runner_exec.start(deployment_id)

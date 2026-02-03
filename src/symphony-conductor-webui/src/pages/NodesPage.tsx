@@ -9,17 +9,10 @@ import {
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
 import { useToast } from '@/hooks/use-toast';
 import Layout from '@/components/Layout';
 import NodeCard from '@/components/nodes/NodeCard';
-import { nodesApi, NodeSnapshot } from '@/lib/api';
+import { nodesApi, NodeSnapshot, subscribeSnapshotStream } from '@/lib/api';
 import { getNodeStatus } from '@/lib/formatters';
 
 const NodesPage = () => {
@@ -29,9 +22,8 @@ const NodesPage = () => {
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
   const [latency, setLatency] = useState<number | null>(null);
   const [autoRefresh, setAutoRefresh] = useState(true);
-  const [refreshInterval, setRefreshInterval] = useState(1000);
+  const [wsConnected, setWsConnected] = useState(false);
   const requestInFlight = useRef(false);
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
 
   const { toast } = useToast();
 
@@ -60,15 +52,27 @@ const NodesPage = () => {
   }, [fetchNodes]);
 
   useEffect(() => {
-    if (autoRefresh) {
-      intervalRef.current = setInterval(fetchNodes, refreshInterval);
+    if (!autoRefresh) {
+      setWsConnected(false);
+      return;
     }
-    return () => {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
+    const unsubscribe = subscribeSnapshotStream(
+      (payload) => {
+        if (payload.type !== 'snapshot') return;
+        setNodes(payload.nodes);
+        setLastUpdate(new Date());
+        setError(null);
+        setLoading(false);
+      },
+      (connected) => {
+        setWsConnected(connected);
+        if (!connected) {
+          setError('Live updates disconnected. You can refresh manually.');
+        }
       }
-    };
-  }, [autoRefresh, refreshInterval, fetchNodes]);
+    );
+    return unsubscribe;
+  }, [autoRefresh]);
 
   const nodeList = Object.values(nodes);
   const healthyCounts = nodeList.reduce(
@@ -131,19 +135,9 @@ const NodesPage = () => {
 
             {/* Controls */}
             <div className="flex items-center gap-2">
-              <Select
-                value={refreshInterval.toString()}
-                onValueChange={(v) => setRefreshInterval(parseInt(v))}
-              >
-                <SelectTrigger className="w-[100px] h-9">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="1000">1s</SelectItem>
-                  <SelectItem value="2000">2s</SelectItem>
-                  <SelectItem value="5000">5s</SelectItem>
-                </SelectContent>
-              </Select>
+              <Badge variant={wsConnected ? 'healthy' : 'secondary'}>
+                {wsConnected ? 'WS Connected' : 'WS Disconnected'}
+              </Badge>
 
               <Button
                 variant={autoRefresh ? 'default' : 'outline'}

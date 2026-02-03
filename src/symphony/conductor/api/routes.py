@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, status
+import asyncio
+
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, status
+from loguru import logger
 
 from symphony.conductor import deployment_store
 from symphony.conductor.deployment_assignment_registry import (
@@ -15,11 +18,13 @@ from symphony.conductor.models import (
 )
 from symphony.conductor.node_registry import NodeRegistry
 from symphony.conductor.service import ConductorService
+from symphony.v1 import protocol_pb2
 
 node_registry = NodeRegistry()
 deployment_ass_registry = DeploymentAssignmentRegistry()
 router_deployment = APIRouter(prefix="/deployments", tags=["deployments"])
 router_nodes = APIRouter(prefix="/nodes", tags=["nodes"])
+router_stream = APIRouter(tags=["stream"])
 
 svc = ConductorService()
 
@@ -35,10 +40,17 @@ async def create_deployment(payload: DeploymentCreate) -> DeploymentResponse:
 async def list_deployments(
     limit: int = 100, offset: int = 0
 ) -> list[DeploymentResponse]:
+    return await _deployment_snapshot(limit=limit, offset=offset)
+
+
+async def _deployment_snapshot(
+    *, limit: int = 100, offset: int = 0
+) -> list[DeploymentResponse]:
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
     deployment_list = await deployment_store.list(limit=limit, offset=offset)
     for deployment in deployment_list:
+        deployment.assigned_node_id = await deployment_ass_registry.get_node(deployment.id)
         deployment.current_state = CurrentState.pending
         try:
             deployment_status = await deployment_ass_registry.get_status(deployment.id)
@@ -46,6 +58,19 @@ async def list_deployments(
         except Exception:
             pass
     return deployment_list
+
+
+async def _nodes_snapshot() -> dict:
+    snapshot = await node_registry.combined_snapshot()
+    deployments = await deployment_store.list_all()
+    deployment_names = {dep.id: dep.name for dep in deployments}
+    for node_id, node in snapshot.items():
+        deployment_ids = await deployment_ass_registry.get_deployments(node_id)
+        node["assigned_deployments"] = [
+            {"id": dep_id, "name": deployment_names.get(dep_id, dep_id)}
+            for dep_id in deployment_ids
+        ]
+    return snapshot
 
 
 @router_deployment.get("/{deployment_id}", response_model=DeploymentResponse)
@@ -69,9 +94,20 @@ async def update_deployment(
     except Exception:
         print("Change not sent to node")
         return dep
+    if not node_id:
+        return dep
     if "desired_state" in patch_json:
         await svc.send_deployment_change(
             node_id, deployment_id, "desired_state", patch_json["desired_state"]
+        )
+    if "specification" in patch_json:
+        await svc.send_message(
+            node_id,
+            protocol_pb2.ConductorToNode(
+                deployment_req=protocol_pb2.DeploymentReq(
+                    specification=dep.model_dump_json()
+                )
+            ),
         )
     return dep
 
@@ -89,6 +125,27 @@ async def delete_deployment(deployment_id: str) -> None:
     summary="List connected nodes with full resource snapshot",
 )
 async def list_nodes():
-    snapshot = await node_registry.combined_snapshot()
+    return {"nodes": await _nodes_snapshot()}
 
-    return {"nodes": snapshot}
+
+@router_stream.websocket("/ws/updates")
+async def stream_updates(websocket: WebSocket) -> None:
+    await websocket.accept()
+    logger.info("Websocket client connected for updates")
+    try:
+        while True:
+            deployments = await _deployment_snapshot(limit=500, offset=0)
+            nodes = await _nodes_snapshot()
+            await websocket.send_json(
+                {
+                    "type": "snapshot",
+                    "deployments": [d.model_dump(mode="json") for d in deployments],
+                    "nodes": nodes,
+                }
+            )
+            await asyncio.sleep(1.0)
+    except asyncio.CancelledError:
+        logger.info("Websocket updates stream cancelled")
+        return
+    except WebSocketDisconnect:
+        logger.info("Websocket client disconnected from updates stream")

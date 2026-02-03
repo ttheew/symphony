@@ -1,6 +1,8 @@
 import asyncio
 import os
+import shlex
 import signal
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -25,6 +27,7 @@ class ExecRuntime:
     stdout_task: Optional[asyncio.Task] = None
     stderr_task: Optional[asyncio.Task] = None
     waiter_task: Optional[asyncio.Task] = None
+    hc_task: Optional[asyncio.Task] = None 
 
     desired_state: str = "STOPPED"  # "RUNNING" | "STOPPED"
     status: str = (
@@ -96,10 +99,61 @@ class RunnerExec:
         self._runtimes: Dict[str, ExecRuntime] = {}
         self._lock = asyncio.Lock()
 
+    async def _restartable_task(
+        self,
+        *,
+        name: str,
+        rt: ExecRuntime,
+        coro_factory,
+        restart_delay: float = 5,
+    ):
+        """
+        Runs a task, restarts it if it crashes.
+        Stops cleanly on cancellation or when exec stops.
+        """
+        while True:
+            try:
+                await coro_factory()
+                # Normal exit → do not restart
+                return
+
+            except asyncio.CancelledError:
+                # Explicit shutdown
+                raise
+
+            except Exception as e:
+                logger.error(
+                    "Task crashed exec_id={} task={} err={}",
+                    rt.exec_id,
+                    name,
+                    e,
+                )
+                await rt.append_log(
+                    "system", f"Task {name} crashed: {e!r}, restarting..."
+                )
+
+                # If process is gone or stopping, do NOT restart
+                async with rt._state_lock:
+                    if rt.process is None or rt.status in ("STOPPING", "STOPPED"):
+                        logger.info(
+                            "Not restarting task exec_id={} task={} (process stopped)",
+                            rt.exec_id,
+                            name,
+                        )
+                        return
+
+                await asyncio.sleep(restart_delay)
+
     async def add_exec(self, exec_id: str, specification: Mapping[str, Any]) -> None:
         spec = dict(specification)
 
-        cmd = spec.get("cmd")
+        logger.debug(
+            "Adding exec process exec_id={} specification={}",
+            exec_id,
+            spec,
+        )
+        config = spec["config"]
+        cmd = config.get("command")
         if (
             not isinstance(cmd, list)
             or not cmd
@@ -107,18 +161,7 @@ class RunnerExec:
         ):
             raise ValueError("spec['cmd'] must be a non-empty list[str]")
 
-        logger.debug(
-            "Add exec process exec_id={} cmd={} cwd={} env_keys={} restart_policy={} max_restarts={} restart_window_sec={} log_limit_lines={}",
-            exec_id,
-            cmd,
-            spec.get("cwd"),
-            list((spec.get("env") or {}).keys()),
-            spec.get("restart_policy"),
-            spec.get("max_restarts"),
-            spec.get("restart_window_sec"),
-            spec.get("log_limit_lines"),
-        )
-
+        old_spec: Optional[Dict[str, Any]] = None
         async with self._lock:
             rt = self._runtimes.get(exec_id)
             if rt is None:
@@ -134,8 +177,15 @@ class RunnerExec:
             else:
                 # Update spec and runtime parameters
                 logger.info("RunnerExec updating existing runtime exec_id={}", exec_id)
+                old_spec = dict(rt.spec)
                 rt.spec = spec
+                rt.capacity_requests = (
+                    spec.get("capacity_requests") if "capacity_requests" in spec else {}
+                )
                 self._apply_spec(rt, spec)
+
+        if rt is not None and old_spec is not None:
+            await self._reconcile_spec_update(rt, old_spec=old_spec, new_spec=spec)
 
     async def remove(self, exec_id: str, *, stop: bool = True) -> None:
         async with self._lock:
@@ -253,8 +303,8 @@ class RunnerExec:
         )
 
     async def _spawn(self, rt: ExecRuntime) -> None:
-        cmd: List[str] = rt.spec["cmd"]
-        cwd = rt.spec.get("cwd")
+        cmd: List[str] = rt.spec["config"]["command"]
+        cwd = rt.spec.get("working_dir")
         env = self._build_env(rt.spec.get("env"))
 
         logger.info(
@@ -289,12 +339,43 @@ class RunnerExec:
         rt.status = "RUNNING"
 
         rt.stdout_task = asyncio.create_task(
-            self._pump_stream(rt, "stdout", rt.process.stdout)
+            self._restartable_task(
+                name="stdout_pump",
+                rt=rt,
+                coro_factory=lambda: self._pump_stream(
+                    rt, "stdout", rt.process.stdout
+                ),
+            )
         )
+
         rt.stderr_task = asyncio.create_task(
-            self._pump_stream(rt, "stderr", rt.process.stderr)
+            self._restartable_task(
+                name="stderr_pump",
+                rt=rt,
+                coro_factory=lambda: self._pump_stream(
+                    rt, "stderr", rt.process.stderr
+                ),
+            )
         )
-        rt.waiter_task = asyncio.create_task(self._wait_process(rt))
+
+        rt.waiter_task = asyncio.create_task(
+            self._restartable_task(
+                name="process waiter",
+                rt=rt,
+                coro_factory=lambda: self._wait_process(rt),
+            )
+        )
+
+        health_check = rt.spec.get("health_check")
+        if health_check:
+            rt.hc_task = asyncio.create_task(
+                self._restartable_task(
+                    name="health_check",
+                    rt=rt,
+                    coro_factory=lambda: self._run_health_check(rt),
+                    restart_delay=2.0,
+                )
+            )
 
     async def _stop(self, rt: ExecRuntime, *, reason: str) -> None:
         proc = rt.process
@@ -344,13 +425,15 @@ class RunnerExec:
                     e,
                 )
 
-        for t in (rt.stdout_task, rt.stderr_task, rt.waiter_task):
-            if t and not t.done():
+        current_task = asyncio.current_task()
+        for t in (rt.stdout_task, rt.stderr_task, rt.waiter_task, rt.hc_task):
+            if t and t is not current_task and not t.done():
                 t.cancel()
 
         rt.stdout_task = None
         rt.stderr_task = None
         rt.waiter_task = None
+        rt.hc_task = None
 
         rt.last_exit_code = proc.returncode
         rt.process = None
@@ -358,6 +441,153 @@ class RunnerExec:
         rt.status = "STOPPED"
 
         await rt.append_log("system", f"Stopped (exit_code={rt.last_exit_code})")
+
+    async def _reconcile_spec_update(
+        self, rt: ExecRuntime, *, old_spec: Dict[str, Any], new_spec: Dict[str, Any]
+    ) -> None:
+        old_cmd = (old_spec.get("config") or {}).get("command")
+        new_cmd = (new_spec.get("config") or {}).get("command")
+        old_cwd = old_spec.get("working_dir")
+        new_cwd = new_spec.get("working_dir")
+        old_env = old_spec.get("env")
+        new_env = new_spec.get("env")
+        old_hc = old_spec.get("health_check")
+        new_hc = new_spec.get("health_check")
+
+        process_config_changed = (
+            old_cmd != new_cmd or old_cwd != new_cwd or old_env != new_env
+        )
+        health_check_changed = old_hc != new_hc
+
+        if process_config_changed:
+            async with rt._state_lock:
+                should_restart = (
+                    rt.desired_state == "RUNNING"
+                    and rt.process is not None
+                    and rt.status in ("STARTING", "RUNNING")
+                )
+            if should_restart:
+                await rt.append_log(
+                    "system", "Spec updated; restarting process to apply new config"
+                )
+                await self._record_restart(
+                    rt, reason="spec-updated-restart", exit_code=None
+                )
+                await self.restart(rt.exec_id, reason="spec updated")
+            return
+
+        if not health_check_changed:
+            return
+
+        async with rt._state_lock:
+            running = rt.process is not None and rt.status in ("STARTING", "RUNNING")
+            old_task = rt.hc_task
+            rt.hc_task = None
+            if old_task and not old_task.done():
+                old_task.cancel()
+            if not running or rt.desired_state != "RUNNING" or not new_hc:
+                return
+            rt.hc_task = asyncio.create_task(
+                self._restartable_task(
+                    name="health_check",
+                    rt=rt,
+                    coro_factory=lambda: self._run_health_check(rt),
+                    restart_delay=2.0,
+                )
+            )
+
+        await rt.append_log("system-hc", "Health check config updated and reloaded")
+
+
+    async def _run_health_check(
+        self,
+        rt: ExecRuntime,
+    ):
+        hc_spec = rt.spec["health_check"]
+        initial_delay_seconds = hc_spec["initial_delay_seconds"]
+        period_seconds = hc_spec["period_seconds"]
+        timeout_seconds = float(hc_spec.get("timeout_seconds", period_seconds))
+        hc_cwd = rt.spec.get("working_dir") or os.getcwd()
+        raw_command = hc_spec.get("command")
+
+        if isinstance(raw_command, list) and all(
+            isinstance(part, str) for part in raw_command
+        ):
+            cmd = raw_command
+        elif isinstance(raw_command, str) and raw_command.strip():
+            cmd = shlex.split(raw_command)
+        else:
+            await rt.append_log(
+                "system-hc", "Health check misconfigured: invalid command"
+            )
+            return
+
+        if len(cmd) == 1 and cmd[0].endswith(".py"):
+            cmd = [sys.executable, cmd[0]]
+
+        await rt.append_log(
+            "system-hc", f"Waiting initial_delay_seconds - {initial_delay_seconds}"
+        )
+        await asyncio.sleep(initial_delay_seconds)
+        await rt.append_log("system-hc", f"Starting periodic health check")
+        try:
+            while True:
+                if rt.process is None:
+                    break
+                await asyncio.sleep(period_seconds)
+                if rt.process is None:
+                    break
+
+                logger.debug("Running health check exec_id={} pid={}",
+                    rt.exec_id,
+                    rt.process.pid,
+                )
+
+                healthy = False
+                detail = ""
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        cwd=hc_cwd,
+                        env=self._build_env(rt.spec.get("env")),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    try:
+                        out, err = await asyncio.wait_for(
+                            proc.communicate(), timeout=timeout_seconds
+                        )
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        out, err = await proc.communicate()
+                        detail = f"timed out after {timeout_seconds}s"
+                    else:
+                        healthy = proc.returncode == 0
+                        if not healthy:
+                            detail = f"exit_code={proc.returncode}"
+
+                    if not healthy:
+                        stdout_text = out.decode(errors="replace").strip() if out else ""
+                        stderr_text = err.decode(errors="replace").strip() if err else ""
+                        if stdout_text:
+                            detail = f"{detail}; stdout={stdout_text}"
+                        if stderr_text:
+                            detail = f"{detail}; stderr={stderr_text}"
+                except Exception as e:
+                    detail = f"exception={e!r}"
+
+                if not healthy:
+                    await rt.append_log(
+                        "system-hc",
+                        f"Health check failed ({detail or 'unknown failure'}), requesting restart",
+                    )
+                    await self._record_restart(
+                        rt, reason="health-check-failed", exit_code=None
+                    )
+                    await self.restart(rt.exec_id, reason="health check failed")
+                    return
+        except asyncio.CancelledError:
+            return
 
     async def _pump_stream(
         self,
@@ -369,6 +599,8 @@ class RunnerExec:
             return
         try:
             while True:
+                if rt.process is None:
+                    break
                 line = await stream.readline()
                 if not line:
                     break
@@ -414,6 +646,7 @@ class RunnerExec:
             rt.stdout_task = None
             rt.stderr_task = None
             rt.waiter_task = None
+            rt.hc_task = None
             rt.stopped_at_ms = rt._now_ms()
 
             if rt.desired_state == "RUNNING":

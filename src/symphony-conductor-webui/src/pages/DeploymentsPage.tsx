@@ -13,6 +13,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
+import { Switch } from '@/components/ui/switch';
 import {
   Select,
   SelectContent,
@@ -53,6 +54,7 @@ import {
   DeploymentResponse,
   DeploymentCreate,
   DeploymentUpdate,
+  subscribeSnapshotStream,
 } from '@/lib/api';
 import { formatTimestamp, truncateId } from '@/lib/formatters';
 
@@ -65,6 +67,7 @@ const DeploymentsPage = () => {
   const [kindFilter, setKindFilter] = useState<string>('ALL');
   const [limit, setLimit] = useState(100);
   const [offset, setOffset] = useState(0);
+  const [updatingStateById, setUpdatingStateById] = useState<Record<string, boolean>>({});
 
   const [modalOpen, setModalOpen] = useState(false);
   const [modalMode, setModalMode] = useState<'create' | 'edit'>('create');
@@ -98,9 +101,21 @@ const DeploymentsPage = () => {
   }, [fetchDeployments]);
 
   useEffect(() => {
-    const interval = setInterval(fetchDeployments, 5000);
-    return () => clearInterval(interval);
-  }, [fetchDeployments]);
+    const unsubscribe = subscribeSnapshotStream(
+      (payload) => {
+        if (payload.type !== 'snapshot') return;
+        setDeployments(payload.deployments);
+        setLoading(false);
+        setError(null);
+      },
+      (connected) => {
+        if (!connected) {
+          setError('Live updates disconnected. You can still refresh manually.');
+        }
+      }
+    );
+    return unsubscribe;
+  }, []);
 
   const filteredDeployments = useMemo(() => {
     return deployments.filter((d) => {
@@ -153,6 +168,36 @@ const DeploymentsPage = () => {
     } finally {
       setDeleteDialogOpen(false);
       setDeploymentToDelete(null);
+    }
+  };
+
+  const handleToggleState = async (deployment: DeploymentResponse) => {
+    const nextState = deployment.desired_state === 'RUNNING' ? 'STOPPED' : 'RUNNING';
+    setUpdatingStateById((prev) => ({ ...prev, [deployment.id]: true }));
+    try {
+      setDeployments((prev) =>
+        prev.map((item) =>
+          item.id === deployment.id ? { ...item, desired_state: nextState } : item
+        )
+      );
+      await deploymentsApi.update(deployment.id, { desired_state: nextState });
+      toast({
+        title: nextState === 'RUNNING' ? 'Started' : 'Stopped',
+        description: `"${deployment.name}" set to ${nextState}`,
+      });
+    } catch (err: any) {
+      setDeployments((prev) =>
+        prev.map((item) =>
+          item.id === deployment.id ? { ...item, desired_state: deployment.desired_state } : item
+        )
+      );
+      toast({
+        variant: 'destructive',
+        title: 'Error',
+        description: err?.detail || 'Failed to update deployment state',
+      });
+    } finally {
+      setUpdatingStateById((prev) => ({ ...prev, [deployment.id]: false }));
     }
   };
 
@@ -255,6 +300,8 @@ const DeploymentsPage = () => {
               <TableRow className="bg-secondary/30 hover:bg-secondary/30">
                 <TableHead className="font-semibold">Name</TableHead>
                 <TableHead className="font-semibold">ID</TableHead>
+                <TableHead className="font-semibold">Assigned Node</TableHead>
+                <TableHead className="font-semibold">Toggle</TableHead>
                 <TableHead className="font-semibold">Desired State</TableHead>
                 <TableHead className="font-semibold">Current State</TableHead>
                 <TableHead className="font-semibold">Kind</TableHead>
@@ -265,13 +312,13 @@ const DeploymentsPage = () => {
             <TableBody>
               {loading ? (
                 <TableRow>
-                  <TableCell colSpan={7} className="h-32 text-center">
+                  <TableCell colSpan={9} className="h-32 text-center">
                     <RefreshCw className="h-6 w-6 animate-spin mx-auto text-muted-foreground" />
                   </TableCell>
                 </TableRow>
               ) : filteredDeployments.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={7} className="h-32 text-center text-muted-foreground">
+                  <TableCell colSpan={9} className="h-32 text-center text-muted-foreground">
                     No deployments found
                   </TableCell>
                 </TableRow>
@@ -283,6 +330,23 @@ const DeploymentsPage = () => {
                       <code className="text-xs bg-secondary px-1.5 py-0.5 rounded font-mono">
                         {truncateId(deployment.id)}
                       </code>
+                    </TableCell>
+                    <TableCell>
+                      {deployment.assigned_node_id ? (
+                        <code className="text-xs bg-secondary px-1.5 py-0.5 rounded font-mono">
+                          {truncateId(deployment.assigned_node_id)}
+                        </code>
+                      ) : (
+                        <Badge variant="secondary">UNASSIGNED</Badge>
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      <Switch
+                        checked={deployment.desired_state === 'RUNNING'}
+                        onCheckedChange={() => handleToggleState(deployment)}
+                        disabled={!!updatingStateById[deployment.id]}
+                        aria-label={`Toggle deployment ${deployment.name}`}
+                      />
                     </TableCell>
                     <TableCell>
                       <Badge variant={getStateVariant(deployment.desired_state)}>

@@ -46,6 +46,7 @@ class DeploymentResponse(BaseModel):
     specification: Dict[str, Any]
     created_at_ms: int
     updated_at_ms: int
+    assigned_node_id: Optional[str] = None
 
 
 class CpuCoreUsage(BaseModel):
@@ -107,6 +108,11 @@ class GpuInfo(BaseModel):
     power_w: float
 
 
+class AssignedDeployment(BaseModel):
+    id: str
+    name: str
+
+
 class NodeSnapshot(BaseModel):
     node_id: str
     groups: List[str]
@@ -121,6 +127,7 @@ class NodeSnapshot(BaseModel):
     memory: MemoryInfo
     storage_mounts: List[StorageMount]
     gpus: Optional[List[GpuInfo]] = None
+    assigned_deployments: List[AssignedDeployment] = Field(default_factory=list)
 
 
 class NodesResponse(BaseModel):

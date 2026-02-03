@@ -1,4 +1,4 @@
-import { Clock, Cpu, HardDrive, MemoryStick, Server, Tag } from 'lucide-react';
+import { Clock, Cpu, HardDrive, Layers, MemoryStick, Server, Tag } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { NodeSnapshot } from '@/lib/api';
 import { formatTimeAgo, formatIsoTimestamp, getNodeStatus, truncateId } from '@/lib/formatters';
@@ -22,6 +22,7 @@ const NodeCard = ({ node }: NodeCardProps) => {
 
   const capacities = node.capacities ?? { total: {}, available: {} };
   const capacityEntries = Object.entries(capacities.total || {});
+  const assignedDeployments = node.assigned_deployments ?? [];
 
   return (
     <div className="bg-card border border-border rounded-xl overflow-hidden hover:border-primary/30 transition-colors card-glow animate-fade-in">
@@ -72,6 +73,26 @@ const NodeCard = ({ node }: NodeCardProps) => {
             })}
           </div>
         )}
+
+        <div className="mt-2">
+          <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-1">
+            <Layers className="h-3 w-3" />
+            <span>Deployments ({assignedDeployments.length})</span>
+          </div>
+          {assignedDeployments.length > 0 ? (
+            <div className="flex flex-wrap gap-1">
+              {assignedDeployments.map((deployment) => (
+                <Badge key={deployment.id} variant="secondary" className="text-[10px] h-5">
+                  {deployment.name} ({truncateId(deployment.id)})
+                </Badge>
+              ))}
+            </div>
+          ) : (
+            <Badge variant="outline" className="text-[10px] h-5">
+              None assigned
+            </Badge>
+          )}
+        </div>
       </div>
 
       {/* Metrics Grid */}
