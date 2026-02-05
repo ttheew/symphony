@@ -29,6 +29,8 @@ class NodeAgent:
         self.r_monitor.start()
         self.runner_exec = RunnerExec()
         self.cap_usage_lock = asyncio.Lock()
+        self._log_subscriptions: dict[str, dict] = {}
+        self._log_subscriptions_lock = asyncio.Lock()
 
     async def _build_heartbeat(self, snap: dict) -> protocol_pb2.Heartbeat:
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -169,6 +171,62 @@ class NodeAgent:
 
         return protocol_pb2.DeploymentStatusList(deployments=deployment_status_list)
 
+    async def _build_deployment_log_messages(self) -> list[protocol_pb2.NodeToConductor]:
+        async with self._log_subscriptions_lock:
+            items = list(self._log_subscriptions.items())
+
+        messages: list[protocol_pb2.NodeToConductor] = []
+        for deployment_id, sub in items:
+            try:
+                logs = await self.runner_exec.logs(
+                    deployment_id,
+                    since_ms=sub.get("since_ms"),
+                    tail=sub.get("tail"),
+                    streams=sub.get("streams"),
+                )
+            except KeyError:
+                async with self._log_subscriptions_lock:
+                    self._log_subscriptions.pop(deployment_id, None)
+                continue
+            except Exception as e:
+                logger.debug(
+                    "Skipping log stream deployment_id={} reason={}",
+                    deployment_id,
+                    e,
+                )
+                continue
+
+            entries = []
+            for ts_ms, stream, line in logs:
+                entries.append(
+                    protocol_pb2.LogEntry(
+                        timestamp_unix_ms=int(ts_ms),
+                        stream=str(stream),
+                        line=str(line),
+                    )
+                )
+
+            if not entries:
+                continue
+
+            async with self._log_subscriptions_lock:
+                current = self._log_subscriptions.get(deployment_id)
+                if current is None:
+                    continue
+                current["since_ms"] = int(entries[-1].timestamp_unix_ms) + 1
+                current["tail"] = None
+
+            messages.append(
+                protocol_pb2.NodeToConductor(
+                    deployment_logs=protocol_pb2.DeploymentLogs(
+                        deployment_id=deployment_id,
+                        entries=entries,
+                    )
+                )
+            )
+
+        return messages
+
     async def _outgoing(
         self,
     ) -> AsyncIterator[protocol_pb2.NodeToConductor]:
@@ -207,6 +265,13 @@ class NodeAgent:
                     yield protocol_pb2.NodeToConductor(deployment_status_list=d_stat)
                 except Exception as e:
                     logger.exception(f"Failed to get deployment status data {e}")
+
+                try:
+                    log_messages = await self._build_deployment_log_messages()
+                    for message in log_messages:
+                        yield message
+                except Exception as e:
+                    logger.exception(f"Failed to stream deployment logs {e}")
 
                 try:
                     await asyncio.sleep(self._cfg.heartbeat_sec)
@@ -259,5 +324,17 @@ class NodeAgent:
                         await self.runner_exec.start(deployment_id)
                     else:
                         await self.runner_exec.stop(deployment_id)
+                elif kind == "deployment_logs_request":
+                    req = msg.deployment_logs_request
+                    if req.enable:
+                        async with self._log_subscriptions_lock:
+                            self._log_subscriptions[req.deployment_id] = {
+                                "since_ms": int(req.since_ms or 0) or None,
+                                "tail": int(req.tail or 200),
+                                "streams": list(req.streams) if req.streams else None,
+                            }
+                    else:
+                        async with self._log_subscriptions_lock:
+                            self._log_subscriptions.pop(req.deployment_id, None)
         finally:
             await channel.close()

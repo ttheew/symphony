@@ -149,3 +149,47 @@ async def stream_updates(websocket: WebSocket) -> None:
         return
     except WebSocketDisconnect:
         logger.info("Websocket client disconnected from updates stream")
+
+
+@router_stream.websocket("/ws/deployments/{deployment_id}/logs")
+async def stream_deployment_logs(websocket: WebSocket, deployment_id: str) -> None:
+    await websocket.accept()
+    node_id = await deployment_ass_registry.get_node(deployment_id)
+    if not node_id:
+        await websocket.send_json(
+            {"deployment_id": deployment_id, "entries": [], "error": "Deployment not assigned"}
+        )
+        await websocket.close(code=1008)
+        return
+
+    query = websocket.query_params
+    try:
+        tail = int(query.get("tail", "200"))
+    except Exception:
+        tail = 200
+    streams_param = query.get("streams")
+    streams = [x.strip() for x in streams_param.split(",") if x.strip()] if streams_param else []
+
+    queue = await svc.subscribe_deployment_logs(
+        node_id=node_id,
+        deployment_id=deployment_id,
+        since_ms=0,
+        tail=max(0, tail),
+        streams=streams,
+    )
+
+    logger.info("Started log stream deployment_id={} node_id={}", deployment_id, node_id)
+    try:
+        while True:
+            payload = await queue.get()
+            await websocket.send_json(payload)
+    except asyncio.CancelledError:
+        logger.info("Deployment logs websocket cancelled deployment_id={}", deployment_id)
+    except WebSocketDisconnect:
+        logger.info("Deployment logs websocket disconnected deployment_id={}", deployment_id)
+    finally:
+        await svc.unsubscribe_deployment_logs(
+            node_id=node_id,
+            deployment_id=deployment_id,
+            queue=queue,
+        )

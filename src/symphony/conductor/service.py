@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import AsyncIterator, Dict, Optional
+from typing import Any, AsyncIterator, Dict, Optional, Set
 
 import grpc
 from loguru import logger
@@ -30,6 +30,9 @@ class ConductorService(protocol_pb2_grpc.ConductorServiceServicer):
         self._streams: Dict[str, grpc.aio.ServicerContext] = {}
         self._out_msg_queue: Dict[str, asyncio.Queue[str]] = {}
         self._deploy_ass_registry = DeploymentAssignmentRegistry()
+        self._log_subscribers: Dict[str, Set[asyncio.Queue[dict]]] = {}
+        self._log_subscribers_lock = asyncio.Lock()
+        self.__class__._init_done = True
 
     async def Connect(
         self,
@@ -160,6 +163,8 @@ class ConductorService(protocol_pb2_grpc.ConductorServiceServicer):
                         await self._deploy_ass_registry.update(
                             node_id=node_id, status=deployment_status
                         )
+                elif kind == "deployment_logs":
+                    await self._publish_deployment_logs(msg.deployment_logs)
 
         finally:
             if consumer_task:
@@ -208,6 +213,115 @@ class ConductorService(protocol_pb2_grpc.ConductorServiceServicer):
                     )
                 ),
             )
+
+    async def subscribe_deployment_logs(
+        self,
+        *,
+        node_id: str,
+        deployment_id: str,
+        since_ms: int = 0,
+        tail: int = 200,
+        streams: Optional[list[str]] = None,
+    ) -> asyncio.Queue[dict]:
+        queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=200)
+        async with self._log_subscribers_lock:
+            subscribers = self._log_subscribers.setdefault(deployment_id, set())
+            should_enable = len(subscribers) == 0
+            subscribers.add(queue)
+            subscriber_count = len(subscribers)
+        logger.info(
+            "Deployment log subscriber added deployment_id={} node_id={} subscribers={}",
+            deployment_id,
+            node_id,
+            subscriber_count,
+        )
+        if should_enable:
+            await self.send_message(
+                node_id,
+                protocol_pb2.ConductorToNode(
+                    deployment_logs_request=protocol_pb2.DeploymentLogsRequest(
+                        deployment_id=deployment_id,
+                        enable=True,
+                        since_ms=int(since_ms or 0),
+                        tail=max(0, int(tail)),
+                        streams=list(streams or []),
+                    )
+                ),
+            )
+        return queue
+
+    async def unsubscribe_deployment_logs(
+        self,
+        *,
+        node_id: str,
+        deployment_id: str,
+        queue: asyncio.Queue[dict],
+    ) -> None:
+        should_disable = False
+        async with self._log_subscribers_lock:
+            subscribers = self._log_subscribers.get(deployment_id)
+            if subscribers is None:
+                return
+            subscribers.discard(queue)
+            subscriber_count = len(subscribers)
+            if len(subscribers) == 0:
+                self._log_subscribers.pop(deployment_id, None)
+                should_disable = True
+        logger.info(
+            "Deployment log subscriber removed deployment_id={} node_id={} subscribers={}",
+            deployment_id,
+            node_id,
+            subscriber_count if "subscriber_count" in locals() else 0,
+        )
+        if should_disable:
+            await self.send_message(
+                node_id,
+                protocol_pb2.ConductorToNode(
+                    deployment_logs_request=protocol_pb2.DeploymentLogsRequest(
+                        deployment_id=deployment_id,
+                        enable=False,
+                    )
+                ),
+            )
+
+    async def _publish_deployment_logs(self, payload: Any) -> None:
+        deployment_id = payload.deployment_id
+        entries = [
+            {
+                "timestamp_unix_ms": int(item.timestamp_unix_ms),
+                "stream": item.stream,
+                "line": item.line,
+            }
+            for item in payload.entries
+        ]
+        if not entries:
+            return
+        async with self._log_subscribers_lock:
+            subscribers = list(self._log_subscribers.get(deployment_id, set()))
+        message = {"deployment_id": deployment_id, "entries": entries}
+        stale_subscribers: list[asyncio.Queue[dict]] = []
+        for queue in subscribers:
+            try:
+                queue.put_nowait(message)
+            except asyncio.QueueFull:
+                try:
+                    _ = queue.get_nowait()
+                except Exception:
+                    pass
+                try:
+                    queue.put_nowait(message)
+                except Exception:
+                    stale_subscribers.append(queue)
+            except Exception:
+                stale_subscribers.append(queue)
+
+        if stale_subscribers:
+            async with self._log_subscribers_lock:
+                subscribers_set = self._log_subscribers.get(deployment_id, set())
+                for queue in stale_subscribers:
+                    subscribers_set.discard(queue)
+                if len(subscribers_set) == 0:
+                    self._log_subscribers.pop(deployment_id, None)
 
     async def disconnect_node(
         self,

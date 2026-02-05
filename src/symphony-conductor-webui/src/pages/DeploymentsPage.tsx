@@ -9,6 +9,7 @@ import {
   Trash2,
   Layers,
   AlertCircle,
+  Terminal,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -49,6 +50,7 @@ import { useToast } from '@/hooks/use-toast';
 import Layout from '@/components/Layout';
 import DeploymentModal from '@/components/deployments/DeploymentModal';
 import DeploymentViewDrawer from '@/components/deployments/DeploymentViewDrawer';
+import DeploymentLogsDrawer from '@/components/deployments/DeploymentLogsDrawer';
 import {
   deploymentsApi,
   DeploymentResponse,
@@ -73,6 +75,7 @@ const DeploymentsPage = () => {
   const [modalMode, setModalMode] = useState<'create' | 'edit'>('create');
   const [selectedDeployment, setSelectedDeployment] = useState<DeploymentResponse | null>(null);
   const [viewDrawerOpen, setViewDrawerOpen] = useState(false);
+  const [logsDrawerOpen, setLogsDrawerOpen] = useState(false);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [deploymentToDelete, setDeploymentToDelete] = useState<DeploymentResponse | null>(null);
 
@@ -148,6 +151,11 @@ const DeploymentsPage = () => {
   const handleDeleteClick = (deployment: DeploymentResponse) => {
     setDeploymentToDelete(deployment);
     setDeleteDialogOpen(true);
+  };
+
+  const handleLogs = (deployment: DeploymentResponse) => {
+    setSelectedDeployment(deployment);
+    setLogsDrawerOpen(true);
   };
 
   const handleDeleteConfirm = async () => {
@@ -384,6 +392,10 @@ const DeploymentsPage = () => {
                             <Pencil className="h-4 w-4 mr-2" />
                             Edit
                           </DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => handleLogs(deployment)}>
+                            <Terminal className="h-4 w-4 mr-2" />
+                            Logs
+                          </DropdownMenuItem>
                           <DropdownMenuItem
                             onClick={() => handleDeleteClick(deployment)}
                             className="text-destructive focus:text-destructive"
@@ -440,6 +452,13 @@ const DeploymentsPage = () => {
         open={viewDrawerOpen}
         onClose={() => setViewDrawerOpen(false)}
         deployment={selectedDeployment}
+      />
+
+      <DeploymentLogsDrawer
+        open={logsDrawerOpen}
+        onClose={() => setLogsDrawerOpen(false)}
+        deploymentId={selectedDeployment?.id || null}
+        deploymentName={selectedDeployment?.name || null}
       />
 
       <AlertDialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>

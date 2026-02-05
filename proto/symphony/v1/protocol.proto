@@ -110,11 +110,31 @@ message DeploymentStatusList {
   repeated DeploymentStatus deployments = 1;
 }
 
+message LogEntry {
+  int64 timestamp_unix_ms = 1;
+  string stream = 2;
+  string line = 3;
+}
+
+message DeploymentLogs {
+  string deployment_id = 1;
+  repeated LogEntry entries = 2;
+}
+
+message DeploymentLogsRequest {
+  string deployment_id = 1;
+  bool enable = 2;
+  int64 since_ms = 3;
+  int32 tail = 4;
+  repeated string streams = 5;
+}
+
 message NodeToConductor {
   oneof msg {
     NodeHello hello = 1;
     Heartbeat heartbeat = 2;
     DeploymentStatusList deployment_status_list = 3;
+    DeploymentLogs deployment_logs = 4;
   }
 }
 
@@ -140,5 +160,6 @@ message ConductorToNode {
     Ack ack = 1;
     DeploymentReq deployment_req = 2;
     DeploymentUpdate deployment_update = 4;
+    DeploymentLogsRequest deployment_logs_request = 5;
   }
 }
