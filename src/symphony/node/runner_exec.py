@@ -5,7 +5,9 @@ import signal
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Mapping, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from loguru import logger
 
@@ -27,7 +29,8 @@ class ExecRuntime:
     stdout_task: Optional[asyncio.Task] = None
     stderr_task: Optional[asyncio.Task] = None
     waiter_task: Optional[asyncio.Task] = None
-    hc_task: Optional[asyncio.Task] = None 
+    hc_task: Optional[asyncio.Task] = None
+    auto_restart_task: Optional[asyncio.Task] = None
 
     desired_state: str = "STOPPED"  # "RUNNING" | "STOPPED"
     status: str = (
@@ -42,10 +45,13 @@ class ExecRuntime:
     _log_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     restart_policy: str = "on-failure"  # "never" | "always" | "on-failure"
+    restart_backoff_seconds: float = 0.5
     max_restarts: int = 10
     restart_window_sec: int = 300
     _restart_times: List[float] = field(default_factory=list)
     restart_history: List[RestartEvent] = field(default_factory=list)
+    auto_restart_cron: Optional[str] = None
+    auto_restart_timezone: Optional[str] = None
 
     _state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -98,6 +104,7 @@ class RunnerExec:
         self._init_done = True
         self._runtimes: Dict[str, ExecRuntime] = {}
         self._lock = asyncio.Lock()
+        self._cron_minute_horizon = 2 * 366 * 24 * 60
 
     async def _restartable_task(
         self,
@@ -252,6 +259,7 @@ class RunnerExec:
                 "stopped_at_ms": rt.stopped_at_ms,
                 "last_exit_code": rt.last_exit_code,
                 "restart_policy": rt.restart_policy,
+                "restart_backoff_seconds": rt.restart_backoff_seconds,
                 "max_restarts": rt.max_restarts,
                 "restart_window_sec": rt.restart_window_sec,
                 "restart_count_window": self._restart_count_in_window(rt),
@@ -294,16 +302,44 @@ class RunnerExec:
         rt.log_limit_lines = int(
             spec.get("log_limit_lines", rt.log_limit_lines or 5000)
         )
-        rt.restart_policy = str(
-            spec.get("restart_policy", rt.restart_policy or "on-failure")
-        )
+        restart_policy_spec = spec.get("restart_policy")
+        if isinstance(restart_policy_spec, Mapping):
+            policy_type = restart_policy_spec.get("type", rt.restart_policy or "on-failure")
+            rt.restart_policy = str(policy_type).strip().lower()
+            try:
+                rt.restart_backoff_seconds = max(
+                    0.0,
+                    float(
+                        restart_policy_spec.get(
+                            "backoff_seconds", rt.restart_backoff_seconds or 0.5
+                        )
+                    ),
+                )
+            except (TypeError, ValueError):
+                rt.restart_backoff_seconds = 0.5
+        else:
+            rt.restart_policy = str(
+                spec.get("restart_policy", rt.restart_policy or "on-failure")
+            ).strip().lower()
+
         rt.max_restarts = int(spec.get("max_restarts", rt.max_restarts or 10))
         rt.restart_window_sec = int(
             spec.get("restart_window_sec", rt.restart_window_sec or 300)
         )
+        auto_restart = spec.get("auto_restart")
+        if isinstance(auto_restart, Mapping) and auto_restart.get("enabled") is True:
+            cron = auto_restart.get("cron")
+            tz_name = auto_restart.get("timezone")
+            if isinstance(cron, str) and cron.strip() and isinstance(tz_name, str) and tz_name.strip():
+                rt.auto_restart_cron = cron.strip()
+                rt.auto_restart_timezone = tz_name.strip()
+                return
+        rt.auto_restart_cron = None
+        rt.auto_restart_timezone = None
 
     async def _spawn(self, rt: ExecRuntime) -> None:
         cmd: List[str] = rt.spec["config"]["command"]
+        run_cmd = self._with_conda_env_if_needed(cmd, rt.spec)
         cwd = rt.spec.get("working_dir")
         env = self._build_env(rt.spec.get("env"))
 
@@ -323,7 +359,7 @@ class RunnerExec:
         await rt.append_log("system", f"Starting: {cmd}")
 
         rt.process = await asyncio.create_subprocess_exec(
-            *cmd,
+            *run_cmd,
             cwd=cwd,
             env=env,
             stdout=asyncio.subprocess.PIPE,
@@ -376,6 +412,7 @@ class RunnerExec:
                     restart_delay=2.0,
                 )
             )
+        self._start_auto_restart_task(rt)
 
     async def _stop(self, rt: ExecRuntime, *, reason: str) -> None:
         proc = rt.process
@@ -426,7 +463,13 @@ class RunnerExec:
                 )
 
         current_task = asyncio.current_task()
-        for t in (rt.stdout_task, rt.stderr_task, rt.waiter_task, rt.hc_task):
+        for t in (
+            rt.stdout_task,
+            rt.stderr_task,
+            rt.waiter_task,
+            rt.hc_task,
+            rt.auto_restart_task,
+        ):
             if t and t is not current_task and not t.done():
                 t.cancel()
 
@@ -434,6 +477,7 @@ class RunnerExec:
         rt.stderr_task = None
         rt.waiter_task = None
         rt.hc_task = None
+        rt.auto_restart_task = None
 
         rt.last_exit_code = proc.returncode
         rt.process = None
@@ -453,11 +497,14 @@ class RunnerExec:
         new_env = new_spec.get("env")
         old_hc = old_spec.get("health_check")
         new_hc = new_spec.get("health_check")
+        old_auto_restart = old_spec.get("auto_restart")
+        new_auto_restart = new_spec.get("auto_restart")
 
         process_config_changed = (
             old_cmd != new_cmd or old_cwd != new_cwd or old_env != new_env
         )
         health_check_changed = old_hc != new_hc
+        auto_restart_changed = old_auto_restart != new_auto_restart
 
         if process_config_changed:
             async with rt._state_lock:
@@ -476,27 +523,36 @@ class RunnerExec:
                 await self.restart(rt.exec_id, reason="spec updated")
             return
 
-        if not health_check_changed:
-            return
+        if health_check_changed:
+            async with rt._state_lock:
+                running = rt.process is not None and rt.status in ("STARTING", "RUNNING")
+                old_task = rt.hc_task
+                rt.hc_task = None
+                if old_task and not old_task.done():
+                    old_task.cancel()
+                if running and rt.desired_state == "RUNNING" and new_hc:
+                    rt.hc_task = asyncio.create_task(
+                        self._restartable_task(
+                            name="health_check",
+                            rt=rt,
+                            coro_factory=lambda: self._run_health_check(rt),
+                            restart_delay=2.0,
+                        )
+                    )
 
-        async with rt._state_lock:
-            running = rt.process is not None and rt.status in ("STARTING", "RUNNING")
-            old_task = rt.hc_task
-            rt.hc_task = None
-            if old_task and not old_task.done():
-                old_task.cancel()
-            if not running or rt.desired_state != "RUNNING" or not new_hc:
-                return
-            rt.hc_task = asyncio.create_task(
-                self._restartable_task(
-                    name="health_check",
-                    rt=rt,
-                    coro_factory=lambda: self._run_health_check(rt),
-                    restart_delay=2.0,
-                )
-            )
+            await rt.append_log("system-hc", "Health check config updated and reloaded")
 
-        await rt.append_log("system-hc", "Health check config updated and reloaded")
+        if auto_restart_changed:
+            async with rt._state_lock:
+                running = rt.process is not None and rt.status in ("STARTING", "RUNNING")
+                old_task = rt.auto_restart_task
+                rt.auto_restart_task = None
+                if old_task and not old_task.done():
+                    old_task.cancel()
+                if running and rt.desired_state == "RUNNING":
+                    self._start_auto_restart_task(rt)
+
+            await rt.append_log("system-ar", "Auto restart config updated and reloaded")
 
 
     async def _run_health_check(
@@ -547,7 +603,7 @@ class RunnerExec:
                 detail = ""
                 try:
                     proc = await asyncio.create_subprocess_exec(
-                        *cmd,
+                        *self._with_conda_env_if_needed(cmd, rt.spec),
                         cwd=hc_cwd,
                         env=self._build_env(rt.spec.get("env")),
                         stdout=asyncio.subprocess.PIPE,
@@ -588,6 +644,211 @@ class RunnerExec:
                     return
         except asyncio.CancelledError:
             return
+
+    def _start_auto_restart_task(self, rt: ExecRuntime) -> None:
+        if not rt.auto_restart_cron or not rt.auto_restart_timezone:
+            return
+        if rt.auto_restart_task and not rt.auto_restart_task.done():
+            rt.auto_restart_task.cancel()
+        rt.auto_restart_task = asyncio.create_task(
+            self._restartable_task(
+                name="auto_restart_scheduler",
+                rt=rt,
+                coro_factory=lambda: self._run_auto_restart(rt),
+                restart_delay=30.0,
+            )
+        )
+
+    async def _run_auto_restart(self, rt: ExecRuntime) -> None:
+        cron_expr = rt.auto_restart_cron
+        tz_name = rt.auto_restart_timezone
+        if not cron_expr or not tz_name:
+            return
+        try:
+            tz = ZoneInfo(tz_name)
+            parsed = self._parse_cron_expr(cron_expr)
+        except Exception as e:
+            await rt.append_log(
+                "system-ar",
+                f"Auto restart disabled due to invalid config: {e}",
+            )
+            return
+
+        await rt.append_log(
+            "system-ar",
+            f"Auto restart enabled (cron='{cron_expr}' timezone='{tz_name}')",
+        )
+
+        while True:
+            now_utc = datetime.now(timezone.utc)
+            try:
+                next_run_utc = self._next_cron_match_utc(
+                    parsed=parsed,
+                    tz=tz,
+                    from_utc=now_utc,
+                )
+            except Exception as e:
+                await rt.append_log("system-ar", f"Failed to calculate next restart: {e}")
+                return
+
+            sleep_sec = max(0.0, (next_run_utc - now_utc).total_seconds())
+            await asyncio.sleep(sleep_sec)
+
+            if rt.desired_state != "RUNNING":
+                return
+
+            await rt.append_log(
+                "system-ar",
+                "Scheduled restart triggered",
+            )
+            await self._record_restart(
+                rt,
+                reason="scheduled-auto-restart",
+                exit_code=None,
+            )
+            await self.restart(rt.exec_id, reason="scheduled auto-restart")
+            return
+
+    def _parse_cron_expr(self, expr: str) -> Dict[str, Any]:
+        parts = expr.split()
+        if len(parts) != 5:
+            raise ValueError("cron must have 5 fields: minute hour day month weekday")
+
+        fields = [
+            self._parse_cron_field(parts[0], 0, 59, "minute"),
+            self._parse_cron_field(parts[1], 0, 23, "hour"),
+            self._parse_cron_field(parts[2], 1, 31, "day"),
+            self._parse_cron_field(parts[3], 1, 12, "month"),
+            self._parse_cron_field(parts[4], 0, 7, "weekday"),
+        ]
+        weekday_values = set()
+        for v in fields[4]["values"]:
+            weekday_values.add(0 if v == 7 else v)
+        fields[4]["values"] = weekday_values
+        return {
+            "minute": fields[0],
+            "hour": fields[1],
+            "day": fields[2],
+            "month": fields[3],
+            "weekday": fields[4],
+        }
+
+    def _parse_cron_field(
+        self, raw: str, min_value: int, max_value: int, label: str
+    ) -> Dict[str, Any]:
+        token = raw.strip()
+        wildcard = token == "*"
+        values: set[int] = set()
+        for piece in token.split(","):
+            piece = piece.strip()
+            if not piece:
+                raise ValueError(f"invalid {label} field '{raw}'")
+            for value in self._expand_cron_piece(piece, min_value, max_value, label):
+                values.add(value)
+        if not values:
+            raise ValueError(f"empty {label} field '{raw}'")
+        return {"wildcard": wildcard, "values": values}
+
+    def _expand_cron_piece(
+        self, piece: str, min_value: int, max_value: int, label: str
+    ) -> List[int]:
+        if "/" in piece:
+            base, step_raw = piece.split("/", 1)
+            try:
+                step = int(step_raw)
+            except Exception as e:
+                raise ValueError(f"invalid {label} step '{step_raw}'") from e
+            if step <= 0:
+                raise ValueError(f"invalid {label} step '{step_raw}'")
+
+            if base == "*":
+                start, end = min_value, max_value
+            elif "-" in base:
+                start_raw, end_raw = base.split("-", 1)
+                start, end = self._parse_cron_range(
+                    start_raw, end_raw, min_value, max_value, label
+                )
+            else:
+                try:
+                    start = int(base)
+                except Exception as e:
+                    raise ValueError(f"invalid {label} value '{base}'") from e
+                if start < min_value or start > max_value:
+                    raise ValueError(f"{label} value out of range: {start}")
+                end = max_value
+
+            return list(range(start, end + 1, step))
+
+        if piece == "*":
+            return list(range(min_value, max_value + 1))
+
+        if "-" in piece:
+            start_raw, end_raw = piece.split("-", 1)
+            start, end = self._parse_cron_range(
+                start_raw, end_raw, min_value, max_value, label
+            )
+            return list(range(start, end + 1))
+
+        try:
+            value = int(piece)
+        except Exception as e:
+            raise ValueError(f"invalid {label} value '{piece}'") from e
+        if value < min_value or value > max_value:
+            raise ValueError(f"{label} value out of range: {value}")
+        return [value]
+
+    def _parse_cron_range(
+        self,
+        start_raw: str,
+        end_raw: str,
+        min_value: int,
+        max_value: int,
+        label: str,
+    ) -> Tuple[int, int]:
+        try:
+            start = int(start_raw)
+            end = int(end_raw)
+        except Exception as e:
+            raise ValueError(f"invalid {label} range '{start_raw}-{end_raw}'") from e
+        if start > end:
+            raise ValueError(f"invalid {label} range '{start}-{end}'")
+        if start < min_value or end > max_value:
+            raise ValueError(f"{label} range out of bounds: '{start}-{end}'")
+        return start, end
+
+    def _next_cron_match_utc(
+        self, *, parsed: Dict[str, Any], tz: ZoneInfo, from_utc: datetime
+    ) -> datetime:
+        cursor = from_utc.astimezone(tz).replace(second=0, microsecond=0) + timedelta(
+            minutes=1
+        )
+        for _ in range(self._cron_minute_horizon):
+            if self._cron_matches_local(parsed, cursor):
+                return cursor.astimezone(timezone.utc)
+            cursor += timedelta(minutes=1)
+        raise ValueError("no matching schedule time found in horizon")
+
+    def _cron_matches_local(self, parsed: Dict[str, Any], dt_local: datetime) -> bool:
+        if dt_local.minute not in parsed["minute"]["values"]:
+            return False
+        if dt_local.hour not in parsed["hour"]["values"]:
+            return False
+        if dt_local.month not in parsed["month"]["values"]:
+            return False
+
+        day_match = dt_local.day in parsed["day"]["values"]
+        cron_dow = (dt_local.weekday() + 1) % 7
+        dow_match = cron_dow in parsed["weekday"]["values"]
+        day_is_wildcard = parsed["day"]["wildcard"]
+        dow_is_wildcard = parsed["weekday"]["wildcard"]
+
+        if day_is_wildcard and dow_is_wildcard:
+            return True
+        if day_is_wildcard:
+            return dow_match
+        if dow_is_wildcard:
+            return day_match
+        return day_match or dow_match
 
     async def _pump_stream(
         self,
@@ -641,6 +902,7 @@ class RunnerExec:
                 proc.pid,
                 code,
             )
+            old_hc_task = rt.hc_task
             rt.last_exit_code = code
             rt.process = None
             rt.stdout_task = None
@@ -654,16 +916,26 @@ class RunnerExec:
             else:
                 rt.status = "STOPPED"
 
+        if old_hc_task and not old_hc_task.done():
+            old_hc_task.cancel()
+
         await rt.append_log("system", f"Process exited (code={code})")
 
         if await self._should_restart(rt, exit_code=code):
             await self._record_restart(rt, reason="auto-restart", exit_code=code)
-            await asyncio.sleep(0.5)
+            backoff_seconds = self._resolve_restart_backoff_seconds(rt)
+            if backoff_seconds > 0:
+                await rt.append_log(
+                    "system",
+                    f"Waiting restart backoff: {backoff_seconds}s",
+                )
+                await asyncio.sleep(backoff_seconds)
             async with rt._state_lock:
                 if rt.desired_state == "RUNNING":
                     logger.info(
-                        "Auto-restarting exec_id={}",
+                        "Auto-restarting exec_id={} backoff_seconds={}",
                         rt.exec_id,
+                        backoff_seconds,
                     )
                     await self._spawn(rt)
 
@@ -736,3 +1008,36 @@ class RunnerExec:
             for k, v in env_override.items():
                 env[str(k)] = str(v)
         return env
+
+    def _resolve_restart_backoff_seconds(self, rt: ExecRuntime) -> float:
+        restart_policy_spec = rt.spec.get("restart_policy")
+        if isinstance(restart_policy_spec, Mapping):
+            raw_backoff = restart_policy_spec.get("backoff_seconds")
+            if raw_backoff is not None:
+                try:
+                    return max(0.0, float(raw_backoff))
+                except (TypeError, ValueError):
+                    pass
+        return max(0.0, float(rt.restart_backoff_seconds or 0.0))
+
+    def _with_conda_env_if_needed(
+        self, cmd: List[str], spec: Mapping[str, Any]
+    ) -> List[str]:
+        config = spec.get("config") if isinstance(spec, Mapping) else None
+        env_name = None
+        if isinstance(config, Mapping):
+            candidate = config.get("env_name")
+            if isinstance(candidate, str) and candidate.strip():
+                env_name = candidate.strip()
+
+        if not env_name:
+            return cmd
+
+        quoted_env_name = shlex.quote(env_name)
+        quoted_cmd = " ".join(shlex.quote(part) for part in cmd)
+        shell_cmd = (
+            "eval \"$(conda shell.bash hook)\" "
+            f"&& conda activate {quoted_env_name} "
+            f"&& exec {quoted_cmd}"
+        )
+        return ["bash", "-lc", shell_cmd]

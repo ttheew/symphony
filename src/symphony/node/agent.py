@@ -155,10 +155,16 @@ class NodeAgent:
         deployment_ids = await self.runner_exec.list_ids()
         deployment_status_list = []
         total_capacities_used = {}
+        allowed_fields = set(protocol_pb2.DeploymentStatus.DESCRIPTOR.fields_by_name)
         for d_id in deployment_ids:
             deployment_status = await self.runner_exec.status(d_id)
             capacity_req = deployment_status["capacity_requests"]
             deployment_status.pop("capacity_requests")
+            deployment_status = {
+                key: value
+                for key, value in deployment_status.items()
+                if key in allowed_fields
+            }
             deployment_status_list.append(
                 protocol_pb2.DeploymentStatus(**deployment_status)
             )
