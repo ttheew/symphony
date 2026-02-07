@@ -13,6 +13,11 @@ Symphony now has a working MVP with:
 - ✅ Node status with CPU/GPU/RAM usage
 - ✅ Automatic scheduling based on virtual capacity availability
 - ✅ Automatic restarts
+- ✅ Scheduled restarts (cron + timezone)
+- ✅ Health checks with auto-restart on failure
+- ✅ Live deployment logs over WebSocket
+- ✅ Conda env management and activation per deployment
+- ✅ Deployment-to-node assignment visibility in API/UI
 
 ---
 
@@ -143,9 +148,12 @@ The Conductor schedules the job to an eligible Node and balances workloads autom
 - ❌ Docker jobs
 - ✅ Exec jobs
 - ✅ Virtual capacity-aware scheduling
-- ❌ Balanced distribution
-- ❌ Heartbeats and health checks
-- ❌ Job logs and exit codes
+- ✅ Heartbeats and health checks
+- ✅ Live deployment log streaming (WebSocket)
+- ✅ Restart policies with backoff (`never` / `on-failure` / `always`)
+- ✅ Scheduled restarts (`auto_restart` cron)
+- ✅ Conda env management + conda activation for exec workloads
+- ✅ Deployment-to-node assignment and assignment reason visibility
 
 ---
 
@@ -178,6 +186,8 @@ symphony --config node.yaml
 Make sure each node has the required executables and files for your jobs.
 
 4. Add deployments from the UI and they will be scheduled automatically.
+
+5. (Optional but recommended) Add conda env definitions from the UI/API so nodes can auto-provision required environments.
 
 
 Command-line options (see `src/symphony/cli.py`):
@@ -294,6 +304,13 @@ Main endpoints (see `src/symphony/conductor/api/routes.py`):
   - `DELETE /deployments/{deployment_id}` – delete a deployment
 - Nodes:
   - `GET /nodes` – list connected nodes with their current resource snapshot
+- Conda Envs:
+  - `POST /conda-envs` – create a conda environment definition
+  - `GET /conda-envs` – list conda environment definitions
+  - `DELETE /conda-envs/{env_name}` – delete a conda environment definition
+- WebSocket Streams:
+  - `GET /ws/updates` – live snapshots for deployments and nodes
+  - `GET /ws/deployments/{deployment_id}/logs` – on-demand live deployment logs
 
 The same FastAPI app also serves a basic web UI under `/ui`.
 
@@ -308,25 +325,46 @@ UI location:
 
 ```json
 {
-  "node_group": "gpu-1",
-  "capacity_requests": {
-    "Analytic1": 1
+  "api_version": "symphony/v1",
+  "kind": "deployment",
+  "metadata": {
+    "id": "eg-deployment",
+    "name": "Eg deployment"
   },
-  "kind": "exec",
-  "config": {
-    "image": "http://..../image.zip",
-    "env_name": "conda-env1",
-    "command": [
-      "python3",
-      "/home/../main.py"
-    ],
-    "env": {
-      "LOG_LEVEL": "info"
+  "spec": {
+    "node_group": "gpu-1",
+    "capacity_requests": {
+      "Analytic1": 1
+    },
+    "health_check": {
+      "type": "exec",
+      "command": "health_check.py",
+      "initial_delay_seconds": 5,
+      "period_seconds": 20
+    },
+    "kind": "exec",
+    "config": {
+      "git_repo": "https://github.com/ttheew/symphony-sample.git",
+      "git_ref": "main",
+      "token": "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",
+      "env_name": "conda-env1",
+      "command": [
+        "python3",
+        "main.py"
+      ],
+      "env": {
+        "LOG_LEVEL": "info"
+      }
+    },
+    "restart_policy": {
+      "type": "on-failure",
+      "backoff_seconds": 10
+    },
+    "auto_restart": {
+      "enabled": true,
+      "cron": "0 3 * * *",
+      "timezone": "Asia/Colombo"
     }
-  },
-  "restart_policy": {
-    "type": "on-failure",
-    "backoff_seconds": 10
   }
 }
 ```
@@ -337,10 +375,30 @@ Key explanations:
 - `capacity_requests` declares required virtual capacity units for scheduling.
 - `kind` selects the workload type (`exec` or `docker`).
 - `config` holds runtime details for the workload.
-- `config.image` is not implemented yet.
-- `config.env_name` is not implemented yet.
-- `config.command` is the entry command to run inside the job.
+- `config.git_repo` points to a git repo to clone before running.
+- `config.git_ref` optionally pins a branch, tag, or commit.
+- `config.token` optionally provides a bearer token for private repos.
+- `config.env_name` selects a conda env to activate before running the command.
+- `config.command` is the entry command to run inside the repo workspace.
 - `config.env` defines environment variables passed to the job process.
-- `restart_policy` controls how failed jobs are retried.
-- `restart_policy.type` is not implemented yet.
-- `restart_policy.backoff_seconds` is not implemented yet.
+- `health_check` runs a periodic command; failures trigger restart.
+- `auto_restart` configures scheduled restarts using cron + timezone.
+- `restart_policy` controls restart behavior and backoff.
+- `restart_policy.type` supports `never`, `on-failure`, and `always`.
+- `restart_policy.backoff_seconds` adds delay before restart attempts.
+
+---
+
+## Simple Flow (Conda + Git Repo)
+
+1. Start one Conductor and one or more Nodes.
+2. Create required conda envs in Symphony (`/conda-envs` or UI).
+3. Create a deployment with:
+   - `config.git_repo` (and optional `git_ref` / `token`)
+   - `config.env_name` (one of your conda envs)
+   - `config.command` (your app startup command)
+4. Conductor assigns the deployment to an eligible node.
+5. Node clones or updates the git repo locally for that deployment.
+6. Node activates the selected conda env and runs the command.
+7. Health checks, restart policy backoff, and optional scheduled restarts keep it healthy.
+8. Watch node/deployment live state on `/ws/updates` and stream logs on `/ws/deployments/{deployment_id}/logs`.
