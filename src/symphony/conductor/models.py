@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class DesiredState(str, Enum):
@@ -47,6 +47,39 @@ class DeploymentResponse(BaseModel):
     created_at_ms: int
     updated_at_ms: int
     assigned_node_id: Optional[str] = None
+    assignment_reason: Optional[str] = None
+
+
+class CondaEnvCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    python_version: str = Field(min_length=1, max_length=20)
+    packages: List[str] = Field(default_factory=list)
+
+    @field_validator("packages", mode="before")
+    @classmethod
+    def _normalize_packages(cls, value):
+        if value is None:
+            return []
+        if isinstance(value, str):
+            parts = [p.strip() for p in value.split(",")]
+            return [p for p in parts if p]
+        return value
+
+    @field_validator("packages")
+    @classmethod
+    def _validate_packages(cls, value: List[str]) -> List[str]:
+        cleaned = [str(p).strip() for p in value if str(p).strip()]
+        return cleaned
+
+
+class CondaEnvResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    name: str
+    python_version: str
+    packages: List[str]
+    created_at_ms: int
+    updated_at_ms: int
 
 
 class CpuCoreUsage(BaseModel):
@@ -128,7 +161,14 @@ class NodeSnapshot(BaseModel):
     storage_mounts: List[StorageMount]
     gpus: Optional[List[GpuInfo]] = None
     assigned_deployments: List[AssignedDeployment] = Field(default_factory=list)
+    conda_envs: List[str] = Field(default_factory=list)
+    schedulable: bool = True
+    missing_conda_envs: List[str] = Field(default_factory=list)
 
 
 class NodesResponse(BaseModel):
     nodes: Dict[str, NodeSnapshot]
+
+
+class CondaEnvsResponse(BaseModel):
+    envs: List[CondaEnvResponse]

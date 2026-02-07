@@ -64,6 +64,20 @@ message GpuUsage {
   double power_w = 7;
 }
 
+message CondaEnvSpec {
+  string name = 1;
+  string python_version = 2;
+  repeated string packages = 3;
+}
+
+message CondaEnvReport {
+  repeated string env_names = 1;
+}
+
+message CondaEnvEnsure {
+  repeated CondaEnvSpec envs = 1;
+}
+
 message NodeHello {
   string node_id = 1;
   repeated string groups = 2;
@@ -135,6 +149,7 @@ message NodeToConductor {
     Heartbeat heartbeat = 2;
     DeploymentStatusList deployment_status_list = 3;
     DeploymentLogs deployment_logs = 4;
+    CondaEnvReport conda_env_report = 5;
   }
 }
 
@@ -161,5 +176,6 @@ message ConductorToNode {
     DeploymentReq deployment_req = 2;
     DeploymentUpdate deployment_update = 4;
     DeploymentLogsRequest deployment_logs_request = 5;
+    CondaEnvEnsure conda_env_ensure = 6;
   }
 }

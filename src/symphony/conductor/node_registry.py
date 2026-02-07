@@ -43,6 +43,7 @@ class NodeRecord:
     static: NodeStaticResources = field(default_factory=NodeStaticResources)
     dynamic: NodeDynamicResources = field(default_factory=NodeDynamicResources)
     last_heartbeat: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    conda_envs: List[str] = field(default_factory=list)
 
 
 class NodeRegistry:
@@ -132,6 +133,7 @@ class NodeRegistry:
             "total_capacities_used": dict(rec.dynamic.total_capacities_used),
             "last_heartbeat": rec.last_heartbeat.isoformat(),
             "dynamic_timestamp_unix_ms": rec.dynamic.timestamp_unix_ms,
+            "conda_envs": list(rec.conda_envs),
             "cpu": {
                 "static": dict(rec.static.cpu),
                 "dynamic": dict(rec.dynamic.cpu),
@@ -221,6 +223,21 @@ class NodeRegistry:
                 rec.dynamic.storage_mounts = [dict(m) for m in dyn_storage_mounts]
             if dyn_gpus is not None:
                 rec.dynamic.gpus = [dict(g) for g in dyn_gpus]
+
+    async def update_conda_envs(self, *, node_id: str, env_names: List[str]) -> None:
+        now = self._now()
+        async with self._lock:
+            rec = self._nodes.get(node_id)
+            if rec is None:
+                rec = NodeRecord(
+                    node_id=node_id,
+                    groups=[],
+                    capacities_total={},
+                    last_heartbeat=now,
+                )
+                self._nodes[node_id] = rec
+            rec.last_heartbeat = now
+            rec.conda_envs = list(env_names)
 
     async def snapshot_records(self) -> Dict[str, NodeRecord]:
         async with self._lock:

@@ -39,6 +39,24 @@ CREATE_DEPLOYMENTS_INDEXES_SQL = [
     """,
 ]
 
+CREATE_CONDA_ENVS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS conda_envs (
+    name            TEXT PRIMARY KEY,
+    python_version  TEXT NOT NULL,
+    packages        JSON NOT NULL
+        CHECK (json_valid(packages)),
+    created_at_ms   INTEGER NOT NULL,
+    updated_at_ms   INTEGER NOT NULL
+);
+"""
+
+CREATE_CONDA_ENVS_INDEXES_SQL = [
+    """
+    CREATE INDEX IF NOT EXISTS idx_conda_envs_name
+        ON conda_envs (name);
+    """,
+]
+
 
 @dataclass(frozen=True)
 class DBConfig:
@@ -79,6 +97,11 @@ class SQLiteAsyncDB:
         await self._conn.execute(CREATE_DEPLOYMENTS_TABLE_SQL)
 
         for sql in CREATE_DEPLOYMENTS_INDEXES_SQL:
+            await self._conn.execute(sql)
+
+        await self._conn.execute(CREATE_CONDA_ENVS_TABLE_SQL)
+
+        for sql in CREATE_CONDA_ENVS_INDEXES_SQL:
             await self._conn.execute(sql)
 
     async def close(self) -> None:

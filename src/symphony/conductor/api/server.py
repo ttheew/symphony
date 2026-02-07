@@ -1,7 +1,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from symphony.conductor.api.routes import router_deployment, router_nodes, router_stream
+from symphony.conductor.api.routes import (
+    router_conda_envs,
+    router_deployment,
+    router_nodes,
+    router_stream,
+)
 from symphony.conductor.ui.ui_router import router_ui
 
 
@@ -22,6 +27,7 @@ def create_app() -> FastAPI:
     )
     app.include_router(router_deployment)
     app.include_router(router_nodes)
+    app.include_router(router_conda_envs)
     app.include_router(router_stream)
     app.include_router(router_ui)
     return app

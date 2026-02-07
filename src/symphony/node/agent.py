@@ -6,6 +6,7 @@ from typing import AsyncIterator
 from loguru import logger
 
 from symphony.config import NodeConfig
+from symphony.node.conda_env import CondaEnvManager
 from symphony.node.runner_exec import RunnerExec
 from symphony.transport.grpc_client import create_channel
 from symphony.util.backoff import backoff
@@ -31,6 +32,11 @@ class NodeAgent:
         self.cap_usage_lock = asyncio.Lock()
         self._log_subscriptions: dict[str, dict] = {}
         self._log_subscriptions_lock = asyncio.Lock()
+        self._conda_env_manager = CondaEnvManager()
+        self._conda_env_names: list[str] = []
+        self._extra_outgoing: asyncio.Queue[protocol_pb2.NodeToConductor] = (
+            asyncio.Queue()
+        )
 
     async def _build_heartbeat(self, snap: dict) -> protocol_pb2.Heartbeat:
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -177,6 +183,22 @@ class NodeAgent:
 
         return protocol_pb2.DeploymentStatusList(deployments=deployment_status_list)
 
+    async def _refresh_conda_envs(self) -> None:
+        try:
+            self._conda_env_names = await self._conda_env_manager.list_env_names()
+        except Exception as exc:
+            logger.warning("Failed to list conda envs: {}", exc)
+
+    def _build_conda_env_report(self) -> protocol_pb2.CondaEnvReport:
+        return protocol_pb2.CondaEnvReport(env_names=list(self._conda_env_names))
+
+    async def _enqueue_conda_report(self) -> None:
+        await self._extra_outgoing.put(
+            protocol_pb2.NodeToConductor(
+                conda_env_report=self._build_conda_env_report()
+            )
+        )
+
     async def _build_deployment_log_messages(self) -> list[protocol_pb2.NodeToConductor]:
         async with self._log_subscriptions_lock:
             items = list(self._log_subscriptions.items())
@@ -258,8 +280,17 @@ class NodeAgent:
 
             hello = self._build_node_hello_from_snapshot(snap)
             yield protocol_pb2.NodeToConductor(hello=hello)
+            await self._refresh_conda_envs()
+            await self._enqueue_conda_report()
 
             while not self._stopped.is_set():
+                while True:
+                    try:
+                        msg = self._extra_outgoing.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    else:
+                        yield msg
                 snap = self.r_monitor.snapshot()
                 try:
                     hb = await self._build_heartbeat(snap)
@@ -342,5 +373,13 @@ class NodeAgent:
                     else:
                         async with self._log_subscriptions_lock:
                             self._log_subscriptions.pop(req.deployment_id, None)
+                elif kind == "conda_env_ensure":
+                    try:
+                        self._conda_env_names = await self._conda_env_manager.ensure_envs(
+                            msg.conda_env_ensure.envs
+                        )
+                        await self._enqueue_conda_report()
+                    except Exception as exc:
+                        logger.warning("Failed to ensure conda envs: {}", exc)
         finally:
             await channel.close()

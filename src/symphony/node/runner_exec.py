@@ -1,9 +1,12 @@
 import asyncio
+import base64
 import os
 import shlex
 import signal
 import sys
 import time
+from pathlib import Path
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -157,7 +160,7 @@ class RunnerExec:
         logger.debug(
             "Adding exec process exec_id={} specification={}",
             exec_id,
-            spec,
+            self._sanitize_spec_for_log(spec),
         )
         config = spec["config"]
         cmd = config.get("command")
@@ -340,8 +343,36 @@ class RunnerExec:
     async def _spawn(self, rt: ExecRuntime) -> None:
         cmd: List[str] = rt.spec["config"]["command"]
         run_cmd = self._with_conda_env_if_needed(cmd, rt.spec)
-        cwd = rt.spec.get("working_dir")
         env = self._build_env(rt.spec.get("env"))
+
+        rt.status = "STARTING"
+        rt.started_at_ms = rt._now_ms()
+        rt.stopped_at_ms = None
+        rt.last_exit_code = None
+
+        repo_workdir = None
+        try:
+            if self._extract_repo_config(rt.spec)[0]:
+                if not shutil.which("git"):
+                    raise RuntimeError("git is required to pull git repo but was not found")
+                repo_workdir = await self._prepare_repo(rt)
+                if repo_workdir:
+                    await rt.append_log(
+                        "system",
+                        f"Git repo prepared at {repo_workdir}",
+                    )
+        except Exception as e:
+            rt.status = "CRASHED"
+            rt.stopped_at_ms = rt._now_ms()
+            await rt.append_log("system", f"Git repo prep failed: {e!r}")
+            logger.error(
+                "Git repo prep failed exec_id={} err={}",
+                rt.exec_id,
+                e,
+            )
+            return
+
+        cwd = repo_workdir
 
         logger.info(
             "Starting exec_id={} cmd={} cwd={} env_keys={}",
@@ -351,20 +382,26 @@ class RunnerExec:
             list((rt.spec.get("env") or {}).keys()),
         )
 
-        rt.status = "STARTING"
-        rt.started_at_ms = rt._now_ms()
-        rt.stopped_at_ms = None
-        rt.last_exit_code = None
-
         await rt.append_log("system", f"Starting: {cmd}")
 
-        rt.process = await asyncio.create_subprocess_exec(
-            *run_cmd,
-            cwd=cwd,
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        try:
+            rt.process = await asyncio.create_subprocess_exec(
+                *run_cmd,
+                cwd=cwd,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception as e:
+            rt.status = "CRASHED"
+            rt.stopped_at_ms = rt._now_ms()
+            await rt.append_log("system", f"Failed to start process: {e!r}")
+            logger.error(
+                "Failed to start process exec_id={} err={}",
+                rt.exec_id,
+                e,
+            )
+            return
 
         logger.info(
             "Started exec_id={} pid={}",
@@ -491,8 +528,8 @@ class RunnerExec:
     ) -> None:
         old_cmd = (old_spec.get("config") or {}).get("command")
         new_cmd = (new_spec.get("config") or {}).get("command")
-        old_cwd = old_spec.get("working_dir")
-        new_cwd = new_spec.get("working_dir")
+        old_repo = (old_spec.get("config") or {}).get("git_repo")
+        new_repo = (new_spec.get("config") or {}).get("git_repo")
         old_env = old_spec.get("env")
         new_env = new_spec.get("env")
         old_hc = old_spec.get("health_check")
@@ -501,7 +538,7 @@ class RunnerExec:
         new_auto_restart = new_spec.get("auto_restart")
 
         process_config_changed = (
-            old_cmd != new_cmd or old_cwd != new_cwd or old_env != new_env
+            old_cmd != new_cmd or old_repo != new_repo or old_env != new_env
         )
         health_check_changed = old_hc != new_hc
         auto_restart_changed = old_auto_restart != new_auto_restart
@@ -563,7 +600,8 @@ class RunnerExec:
         initial_delay_seconds = hc_spec["initial_delay_seconds"]
         period_seconds = hc_spec["period_seconds"]
         timeout_seconds = float(hc_spec.get("timeout_seconds", period_seconds))
-        hc_cwd = rt.spec.get("working_dir") or os.getcwd()
+        repo, _, _ = self._extract_repo_config(rt.spec)
+        hc_cwd = str(self._repo_workdir(rt.exec_id)) if repo else os.getcwd()
         raw_command = hc_spec.get("command")
 
         if isinstance(raw_command, list) and all(
@@ -1008,6 +1046,190 @@ class RunnerExec:
             for k, v in env_override.items():
                 env[str(k)] = str(v)
         return env
+
+    def _sanitize_spec_for_log(self, spec: Mapping[str, Any]) -> Dict[str, Any]:
+        safe = dict(spec)
+        config = safe.get("config")
+        if isinstance(config, Mapping):
+            config = dict(config)
+            if "token" in config:
+                config["token"] = "***"
+            safe["config"] = config
+        return safe
+
+    def _extract_repo_config(
+        self, spec: Mapping[str, Any]
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        config = spec.get("config") if isinstance(spec, Mapping) else None
+        if not isinstance(config, Mapping):
+            return None, None, None
+        repo = config.get("git_repo")
+        token = config.get("token")
+        ref = config.get("git_ref")
+        repo_str = repo.strip() if isinstance(repo, str) else None
+        token_str = token.strip() if isinstance(token, str) else None
+        ref_str = ref.strip() if isinstance(ref, str) else None
+        return (repo_str or None), (token_str or None), (ref_str or None)
+
+    async def _run_subprocess(
+        self,
+        cmd: List[str],
+        *,
+        cwd: Optional[str] = None,
+        env: Optional[Dict[str, str]] = None,
+    ) -> tuple[int, str, str]:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=cwd,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out_b, err_b = await proc.communicate()
+        out = out_b.decode(errors="replace") if out_b else ""
+        err = err_b.decode(errors="replace") if err_b else ""
+        return proc.returncode or 0, out, err
+
+    def _repo_workdir(self, exec_id: str) -> Path:
+        return Path("/tmp/symphony/repos") / exec_id
+
+    async def _prepare_repo(self, rt: ExecRuntime) -> Optional[str]:
+        repo, token, ref = self._extract_repo_config(rt.spec)
+        if not repo:
+            return None
+
+        dest = self._repo_workdir(rt.exec_id)
+        await asyncio.to_thread(dest.parent.mkdir, parents=True, exist_ok=True)
+
+        git_env = dict(os.environ)
+        # Hard-disable interactive prompts so git fails fast instead of blocking.
+        git_env["GIT_TERMINAL_PROMPT"] = "0"
+        git_env["GIT_ASKPASS"] = "/bin/false"
+        git_env["SSH_ASKPASS"] = "/bin/false"
+
+        git_cmd_prefix: List[str] = ["git"]
+        if token and repo.startswith(("http://", "https://")):
+            # Use an auth header so we don't mutate the URL.
+            # Git over HTTPS typically expects Basic auth, e.g. "x-access-token:<token>".
+            basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+            git_cmd_prefix = [
+                "git",
+                "-c",
+                f"http.extraHeader=Authorization: Basic {basic}",
+            ]
+
+        def _raise_git_error(op: str, err: str) -> None:
+            msg = err.strip() or "unknown git error"
+            lowered = msg.lower()
+            auth_related = (
+                "authentication failed" in lowered
+                or "could not read username" in lowered
+                or "terminal prompts disabled" in lowered
+                or "401" in lowered
+                or "403" in lowered
+            )
+            if auth_related:
+                if token:
+                    raise RuntimeError(
+                        f"git {op} failed: invalid/unauthorized token for {repo}"
+                    )
+                raise RuntimeError(
+                    f"git {op} failed: authentication required for {repo}"
+                )
+            raise RuntimeError(f"git {op} failed: {msg}")
+
+        async def _checkout_ref() -> None:
+            if not ref:
+                return
+            # Prefer remote branch if it exists, otherwise treat as tag/commit.
+            rc, _, _ = await self._run_subprocess(
+                git_cmd_prefix + ["rev-parse", "--verify", f"refs/remotes/origin/{ref}"],
+                cwd=str(dest),
+                env=git_env,
+            )
+            if rc == 0:
+                rc, _, err = await self._run_subprocess(
+                    git_cmd_prefix + ["checkout", "-B", ref, f"origin/{ref}"],
+                    cwd=str(dest),
+                    env=git_env,
+                )
+                if rc != 0:
+                    _raise_git_error("checkout", err)
+                rc, _, err = await self._run_subprocess(
+                    git_cmd_prefix + ["reset", "--hard", f"origin/{ref}"],
+                    cwd=str(dest),
+                    env=git_env,
+                )
+                if rc != 0:
+                    _raise_git_error("reset", err)
+                return
+
+            rc, _, err = await self._run_subprocess(
+                git_cmd_prefix + ["checkout", ref],
+                cwd=str(dest),
+                env=git_env,
+            )
+            if rc != 0:
+                _raise_git_error("checkout", err)
+
+        if dest.exists():
+            git_dir = dest / ".git"
+            if not git_dir.exists():
+                await asyncio.to_thread(shutil.rmtree, dest, ignore_errors=True)
+            else:
+                # Update existing repo to the latest remote HEAD.
+                rc, _, err = await self._run_subprocess(
+                    git_cmd_prefix + ["remote", "set-url", "origin", repo],
+                    cwd=str(dest),
+                    env=git_env,
+                )
+                if rc != 0:
+                    _raise_git_error("remote set-url", err)
+
+                rc, _, err = await self._run_subprocess(
+                    git_cmd_prefix + ["fetch", "origin", "--prune", "--tags"],
+                    cwd=str(dest),
+                    env=git_env,
+                )
+                if rc != 0:
+                    _raise_git_error("fetch", err)
+
+                if ref:
+                    await _checkout_ref()
+                else:
+                    rc, _, err = await self._run_subprocess(
+                        git_cmd_prefix + ["reset", "--hard", "origin/HEAD"],
+                        cwd=str(dest),
+                        env=git_env,
+                    )
+                    if rc != 0:
+                        _raise_git_error("reset", err)
+
+                rc, _, err = await self._run_subprocess(
+                    git_cmd_prefix + ["clean", "-fd"],
+                    cwd=str(dest),
+                    env=git_env,
+                )
+                if rc != 0:
+                    _raise_git_error("clean", err)
+
+                return str(dest)
+
+        clone_cmd = git_cmd_prefix + ["clone", "--depth", "1"]
+        if ref:
+            clone_cmd += ["--branch", ref]
+        clone_cmd += [repo, str(dest)]
+        rc, _, err = await self._run_subprocess(
+            clone_cmd,
+            env=git_env,
+        )
+        if rc != 0:
+            _raise_git_error("clone", err)
+
+        if ref:
+            await _checkout_ref()
+
+        return str(dest)
 
     def _resolve_restart_backoff_seconds(self, rt: ExecRuntime) -> float:
         restart_policy_spec = rt.spec.get("restart_policy")

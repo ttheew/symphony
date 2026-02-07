@@ -345,7 +345,9 @@ const DeploymentsPage = () => {
                           {truncateId(deployment.assigned_node_id)}
                         </code>
                       ) : (
-                        <Badge variant="secondary">UNASSIGNED</Badge>
+                        <Badge variant="secondary">
+                          UNASSIGNED{deployment.assignment_reason ? ` • ${deployment.assignment_reason}` : ''}
+                        </Badge>
                       )}
                     </TableCell>
                     <TableCell>

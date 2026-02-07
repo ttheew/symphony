@@ -8,6 +8,7 @@ from loguru import logger
 from symphony.conductor.deployment_assignment_registry import (
     DeploymentAssignmentRegistry,
 )
+from symphony.conductor import conda_env_store
 from symphony.conductor.deployment_store import list_all
 from symphony.conductor.node_registry import NodeRecord, NodeRegistry
 from symphony.conductor.service import ConductorService
@@ -64,6 +65,8 @@ class NodeScheduler:
 
     async def assign_deployment(self) -> None:
         all_deployments = await list_all()
+        required_envs = await conda_env_store.list_all()
+        required_names = {env.name for env in required_envs}
         for deployment in all_deployments:
             deployment_id = deployment.id
             node_id = await self._deploy_ass_registry.get_node(deployment_id)
@@ -74,6 +77,37 @@ class NodeScheduler:
                 logger.warning(f"No nodes found for deployments")
                 return
             spec = (deployment.specification or {}).get("spec") or {}
+            spec_config = spec.get("config") if isinstance(spec, dict) else None
+            env_name = None
+            if isinstance(spec_config, dict):
+                candidate = spec_config.get("env_name")
+                if isinstance(candidate, str) and candidate.strip():
+                    env_name = candidate.strip()
+
+            required_for_deployment = set(required_names)
+            if env_name:
+                if required_names and env_name not in required_names:
+                    logger.warning(
+                        "Deployment {} requires env {} not defined in conda envs",
+                        deployment_id,
+                        env_name,
+                    )
+                    continue
+                if not required_names:
+                    required_for_deployment.add(env_name)
+
+            if required_for_deployment:
+                snapshot_nodes = {
+                    nid: rec
+                    for nid, rec in snapshot_nodes.items()
+                    if required_for_deployment.issubset(set(rec.conda_envs or []))
+                }
+                if not snapshot_nodes:
+                    logger.warning(
+                        "No schedulable nodes (missing conda envs) for deployment {}",
+                        deployment_id,
+                    )
+                    continue
             capacity_request = spec.get("capacity_requests") or {}
 
             if not capacity_request:

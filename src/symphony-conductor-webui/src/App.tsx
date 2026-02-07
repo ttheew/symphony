@@ -6,6 +6,7 @@ import { BrowserRouter, Routes, Route } from "react-router-dom";
 import Index from "./pages/Index";
 import DeploymentsPage from "./pages/DeploymentsPage";
 import NodesPage from "./pages/NodesPage";
+import CondaEnvsPage from "./pages/CondaEnvsPage";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -23,6 +24,7 @@ const App = () => {
             <Route path="/" element={<Index />} />
             <Route path="/deployments" element={<DeploymentsPage />} />
             <Route path="/nodes" element={<NodesPage />} />
+            <Route path="/conda-envs" element={<CondaEnvsPage />} />
             <Route path="*" element={<NotFound />} />
           </Routes>
         </BrowserRouter>

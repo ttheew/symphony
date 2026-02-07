@@ -1,5 +1,5 @@
 import { Link, useLocation } from 'react-router-dom';
-import { Activity, Layers, Settings, Server } from 'lucide-react';
+import { FlaskConical, Layers, Settings, Server } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import ThemeToggle from '@/components/ThemeToggle';
 
@@ -13,6 +13,7 @@ const Layout = ({ children }: LayoutProps) => {
   const navItems = [
     { path: '/deployments', label: 'Deployments', icon: Layers },
     { path: '/nodes', label: 'Nodes', icon: Server },
+    { path: '/conda-envs', label: 'Conda Envs', icon: FlaskConical },
   ];
 
   return (

@@ -13,6 +13,8 @@ interface NodeCardProps {
 
 const NodeCard = ({ node }: NodeCardProps) => {
   const status = getNodeStatus(node.last_heartbeat);
+  const schedulable = node.schedulable ?? true;
+  const missingEnvs = node.missing_conda_envs ?? [];
 
   const statusLabels = {
     healthy: 'Healthy',
@@ -35,9 +37,17 @@ const NodeCard = ({ node }: NodeCardProps) => {
               {truncateId(node.node_id, 12)}
             </span>
           </div>
-          <Badge variant={status}>
-            {statusLabels[status]}
-          </Badge>
+          <div className="flex flex-col items-end gap-1">
+            <Badge variant={status}>
+              {statusLabels[status]}
+            </Badge>
+            <Badge
+              variant={schedulable ? 'secondary' : 'destructive'}
+              className="text-[10px] h-5"
+            >
+              {schedulable ? 'Schedulable' : 'Blocked'}
+            </Badge>
+          </div>
         </div>
 
         {/* Groups */}
@@ -73,6 +83,22 @@ const NodeCard = ({ node }: NodeCardProps) => {
             })}
           </div>
         )}
+
+        <div className="mt-2">
+          <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-1">
+            <Tag className="h-3 w-3" />
+            <span>Conda Envs ({node.conda_envs?.length ?? 0})</span>
+          </div>
+          {schedulable ? (
+            <Badge variant="outline" className="text-[10px] h-5">
+              All required envs available
+            </Badge>
+          ) : (
+            <Badge variant="destructive" className="text-[10px] h-5">
+              Missing: {missingEnvs.join(', ') || 'unknown'}
+            </Badge>
+          )}
+        </div>
 
         <div className="mt-2">
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-1">

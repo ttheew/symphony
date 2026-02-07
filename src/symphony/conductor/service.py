@@ -9,6 +9,7 @@ from loguru import logger
 from symphony.conductor.deployment_assignment_registry import (
     DeploymentAssignmentRegistry,
 )
+from symphony.conductor import conda_env_store
 from symphony.conductor.node_registry import NodeAlreadyRegisteredError, NodeRegistry
 from symphony.v1 import protocol_pb2, protocol_pb2_grpc
 
@@ -165,6 +166,8 @@ class ConductorService(protocol_pb2_grpc.ConductorServiceServicer):
                         )
                 elif kind == "deployment_logs":
                     await self._publish_deployment_logs(msg.deployment_logs)
+                elif kind == "conda_env_report":
+                    await self._handle_conda_env_report(node_id, msg.conda_env_report)
 
         finally:
             if consumer_task:
@@ -200,6 +203,27 @@ class ConductorService(protocol_pb2_grpc.ConductorServiceServicer):
             logger.warning(f"Adding message to {node_id} que failed")
         else:
             await self._out_msg_queue[node_id].put(message)
+
+    async def ensure_envs_on_all_nodes(self, envs) -> None:
+        if not envs:
+            return
+        snapshot = await self._registry.snapshot_records()
+        for node_id in snapshot.keys():
+            await self.send_message(
+                node_id,
+                protocol_pb2.ConductorToNode(
+                    conda_env_ensure=protocol_pb2.CondaEnvEnsure(
+                        envs=[
+                            protocol_pb2.CondaEnvSpec(
+                                name=env.name,
+                                python_version=env.python_version,
+                                packages=list(env.packages or []),
+                            )
+                            for env in envs
+                        ]
+                    )
+                ),
+            )
 
     async def send_deployment_change(
         self, node_id, deployment_id, kind: str, change: str
@@ -322,6 +346,33 @@ class ConductorService(protocol_pb2_grpc.ConductorServiceServicer):
                     subscribers_set.discard(queue)
                 if len(subscribers_set) == 0:
                     self._log_subscribers.pop(deployment_id, None)
+
+    async def _handle_conda_env_report(self, node_id: str, report) -> None:
+        if not node_id:
+            return
+        env_names = [name for name in report.env_names if str(name).strip()]
+        await self._registry.update_conda_envs(node_id=node_id, env_names=env_names)
+        required_envs = await conda_env_store.list_all()
+        if not required_envs:
+            return
+        missing = [env for env in required_envs if env.name not in env_names]
+        if not missing:
+            return
+        await self.send_message(
+            node_id,
+            protocol_pb2.ConductorToNode(
+                conda_env_ensure=protocol_pb2.CondaEnvEnsure(
+                    envs=[
+                        protocol_pb2.CondaEnvSpec(
+                            name=env.name,
+                            python_version=env.python_version,
+                            packages=list(env.packages or []),
+                        )
+                        for env in missing
+                    ]
+                )
+            ),
+        )
 
     async def disconnect_node(
         self,
