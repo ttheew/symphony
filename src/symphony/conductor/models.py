@@ -54,6 +54,7 @@ class CondaEnvCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     python_version: str = Field(min_length=1, max_length=20)
     packages: List[str] = Field(default_factory=list)
+    custom_script: str = Field(default="", max_length=2000)
 
     @field_validator("packages", mode="before")
     @classmethod
@@ -71,6 +72,41 @@ class CondaEnvCreate(BaseModel):
         cleaned = [str(p).strip() for p in value if str(p).strip()]
         return cleaned
 
+    @field_validator("custom_script")
+    @classmethod
+    def _validate_custom_script(cls, value: str) -> str:
+        return str(value or "").strip()
+
+
+class CondaEnvUpdate(BaseModel):
+    packages: Optional[List[str]] = None
+    custom_script: Optional[str] = Field(default=None, max_length=2000)
+
+    @field_validator("packages", mode="before")
+    @classmethod
+    def _normalize_packages(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            parts = [p.strip() for p in value.split(",")]
+            return [p for p in parts if p]
+        return value
+
+    @field_validator("packages")
+    @classmethod
+    def _validate_packages(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return None
+        cleaned = [str(p).strip() for p in value if str(p).strip()]
+        return cleaned
+
+    @field_validator("custom_script")
+    @classmethod
+    def _validate_custom_script(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        return str(value).strip()
+
 
 class CondaEnvResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -78,6 +114,7 @@ class CondaEnvResponse(BaseModel):
     name: str
     python_version: str
     packages: List[str]
+    custom_script: str
     created_at_ms: int
     updated_at_ms: int
 

@@ -1,5 +1,16 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Plus, RefreshCw, Search, Trash2, FlaskConical } from 'lucide-react';
+import {
+  Plus,
+  RefreshCw,
+  Search,
+  Trash2,
+  FlaskConical,
+  MoreHorizontal,
+  Eye,
+  FileCode2,
+  RotateCcw,
+  Pencil,
+} from 'lucide-react';
 import Layout from '@/components/Layout';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -22,8 +33,21 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import { useToast } from '@/hooks/use-toast';
-import { condaEnvsApi, CondaEnvCreate, CondaEnvResponse } from '@/lib/api';
+import { condaEnvsApi, CondaEnvCreate, CondaEnvResponse, CondaEnvUpdate } from '@/lib/api';
 import { formatTimestamp } from '@/lib/formatters';
 import CondaEnvModal from '@/components/conda/CondaEnvModal';
 
@@ -33,8 +57,14 @@ const CondaEnvsPage = () => {
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const [modalOpen, setModalOpen] = useState(false);
+  const [modalMode, setModalMode] = useState<'create' | 'edit'>('create');
+  const [envToEdit, setEnvToEdit] = useState<CondaEnvResponse | null>(null);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [envToDelete, setEnvToDelete] = useState<CondaEnvResponse | null>(null);
+  const [rerunningByName, setRerunningByName] = useState<Record<string, boolean>>({});
+  const [detailsDialogOpen, setDetailsDialogOpen] = useState(false);
+  const [detailsType, setDetailsType] = useState<'packages' | 'custom_script'>('packages');
+  const [envForDetails, setEnvForDetails] = useState<CondaEnvResponse | null>(null);
 
   const { toast } = useToast();
 
@@ -67,15 +97,45 @@ const CondaEnvsPage = () => {
   }, [envs, search]);
 
   const handleCreate = () => {
+    setModalMode('create');
+    setEnvToEdit(null);
     setModalOpen(true);
   };
 
-  const handleModalSubmit = async (data: CondaEnvCreate) => {
+  const handleEdit = (env: CondaEnvResponse) => {
+    setModalMode('edit');
+    setEnvToEdit(env);
+    setModalOpen(true);
+  };
+
+  const handleModalSubmit = async (data: CondaEnvCreate | CondaEnvUpdate) => {
+    if (modalMode === 'edit') {
+      if (!envToEdit) return;
+      try {
+        await condaEnvsApi.update(envToEdit.name, data as CondaEnvUpdate);
+        toast({
+          title: 'Updated',
+          description: `Conda env "${envToEdit.name}" has been updated`,
+        });
+        setModalOpen(false);
+        setEnvToEdit(null);
+        fetchEnvs();
+      } catch (err: any) {
+        toast({
+          variant: 'destructive',
+          title: 'Error',
+          description: err?.detail || 'Failed to update conda env',
+        });
+      }
+      return;
+    }
+
     try {
-      await condaEnvsApi.create(data);
+      const createData = data as CondaEnvCreate;
+      await condaEnvsApi.create(createData);
       toast({
         title: 'Created',
-        description: `Conda env "${data.name}" has been created`,
+        description: `Conda env "${createData.name}" has been created`,
       });
       setModalOpen(false);
       fetchEnvs();
@@ -91,6 +151,37 @@ const CondaEnvsPage = () => {
   const handleDeleteClick = (env: CondaEnvResponse) => {
     setEnvToDelete(env);
     setDeleteDialogOpen(true);
+  };
+
+  const handleViewPackages = (env: CondaEnvResponse) => {
+    setEnvForDetails(env);
+    setDetailsType('packages');
+    setDetailsDialogOpen(true);
+  };
+
+  const handleViewCustomScript = (env: CondaEnvResponse) => {
+    setEnvForDetails(env);
+    setDetailsType('custom_script');
+    setDetailsDialogOpen(true);
+  };
+
+  const handleForceRerun = async (env: CondaEnvResponse) => {
+    setRerunningByName((prev) => ({ ...prev, [env.name]: true }));
+    try {
+      await condaEnvsApi.rerun(env.name);
+      toast({
+        title: 'Force rerun queued',
+        description: `Conda env "${env.name}" will be recreated on connected nodes`,
+      });
+    } catch (err: any) {
+      toast({
+        variant: 'destructive',
+        title: 'Error',
+        description: err?.detail || 'Failed to force rerun conda env',
+      });
+    } finally {
+      setRerunningByName((prev) => ({ ...prev, [env.name]: false }));
+    }
   };
 
   const handleDeleteConfirm = async () => {
@@ -161,6 +252,7 @@ const CondaEnvsPage = () => {
                 <TableHead>Name</TableHead>
                 <TableHead>Python</TableHead>
                 <TableHead>Packages</TableHead>
+                <TableHead>Custom Script</TableHead>
                 <TableHead>Created</TableHead>
                 <TableHead className="text-right">Actions</TableHead>
               </TableRow>
@@ -168,14 +260,14 @@ const CondaEnvsPage = () => {
             <TableBody>
               {loading && (
                 <TableRow>
-                  <TableCell colSpan={5} className="text-center text-muted-foreground">
+                  <TableCell colSpan={6} className="text-center text-muted-foreground">
                     Loading conda envs...
                   </TableCell>
                 </TableRow>
               )}
               {!loading && filtered.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={5} className="text-center text-muted-foreground">
+                  <TableCell colSpan={6} className="text-center text-muted-foreground">
                     No conda envs found
                   </TableCell>
                 </TableRow>
@@ -194,22 +286,57 @@ const CondaEnvsPage = () => {
                       <TableCell className="font-medium">{env.name}</TableCell>
                       <TableCell>{env.python_version}</TableCell>
                       <TableCell className="text-muted-foreground">{preview}</TableCell>
+                      <TableCell className="text-muted-foreground">
+                        {env.custom_script ? 'Configured' : '—'}
+                      </TableCell>
                       <TableCell>{formatTimestamp(env.created_at_ms)}</TableCell>
                       <TableCell className="text-right">
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={() => handleDeleteClick(env)}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
+                        <div className="flex items-center justify-end gap-1">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => handleForceRerun(env)}
+                            disabled={!!rerunningByName[env.name]}
+                          >
+                            <RotateCcw className="h-4 w-4 mr-2" />
+                            Force Rerun
+                          </Button>
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button variant="ghost" size="icon">
+                                <MoreHorizontal className="h-4 w-4" />
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end">
+                              <DropdownMenuItem onClick={() => handleViewPackages(env)}>
+                                <Eye className="h-4 w-4 mr-2" />
+                                View Packages
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onClick={() => handleViewCustomScript(env)}>
+                                <FileCode2 className="h-4 w-4 mr-2" />
+                                View Custom Script
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onClick={() => handleEdit(env)}>
+                                <Pencil className="h-4 w-4 mr-2" />
+                                Edit
+                              </DropdownMenuItem>
+                              <DropdownMenuItem
+                                onClick={() => handleDeleteClick(env)}
+                                className="text-destructive focus:text-destructive"
+                              >
+                                <Trash2 className="h-4 w-4 mr-2" />
+                                Delete
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        </div>
                       </TableCell>
                     </TableRow>
                   );
                 })}
               {!loading && error && (
                 <TableRow>
-                  <TableCell colSpan={5} className="text-center text-destructive">
+                  <TableCell colSpan={6} className="text-center text-destructive">
                     {error}
                   </TableCell>
                 </TableRow>
@@ -221,9 +348,46 @@ const CondaEnvsPage = () => {
 
       <CondaEnvModal
         open={modalOpen}
-        onClose={() => setModalOpen(false)}
+        onClose={() => {
+          setModalOpen(false);
+          setEnvToEdit(null);
+        }}
+        mode={modalMode}
+        initialEnv={envToEdit}
         onSubmit={handleModalSubmit}
       />
+
+      <Dialog open={detailsDialogOpen} onOpenChange={setDetailsDialogOpen}>
+        <DialogContent className="sm:max-w-2xl bg-card border-border">
+          <DialogHeader>
+            <DialogTitle>
+              {detailsType === 'packages' ? 'Conda Packages' : 'Custom Script'}
+            </DialogTitle>
+            <DialogDescription>
+              {envForDetails ? `Env: ${envForDetails.name}` : 'Conda env details'}
+            </DialogDescription>
+          </DialogHeader>
+          {detailsType === 'packages' ? (
+            <div className="rounded-lg border border-border p-3 max-h-[420px] overflow-auto">
+              {(envForDetails?.packages ?? []).length > 0 ? (
+                <ul className="space-y-1">
+                  {(envForDetails?.packages ?? []).map((pkg, idx) => (
+                    <li key={`${pkg}-${idx}`} className="font-mono text-sm">
+                      {pkg}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-sm text-muted-foreground">No packages configured.</p>
+              )}
+            </div>
+          ) : (
+            <pre className="rounded-lg border border-border bg-secondary/20 p-3 text-sm font-mono whitespace-pre-wrap max-h-[420px] overflow-auto">
+              {envForDetails?.custom_script || 'No custom script configured.'}
+            </pre>
+          )}
+        </DialogContent>
+      </Dialog>
 
       <AlertDialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
         <AlertDialogContent>

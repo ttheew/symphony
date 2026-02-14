@@ -10,12 +10,14 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import { CondaEnvCreate } from '@/lib/api';
+import { CondaEnvCreate, CondaEnvResponse, CondaEnvUpdate } from '@/lib/api';
 
 interface CondaEnvModalProps {
   open: boolean;
   onClose: () => void;
-  onSubmit: (data: CondaEnvCreate) => Promise<void>;
+  mode: 'create' | 'edit';
+  initialEnv?: CondaEnvResponse | null;
+  onSubmit: (data: CondaEnvCreate | CondaEnvUpdate) => Promise<void>;
 }
 
 const parsePackages = (value: string): string[] =>
@@ -24,20 +26,35 @@ const parsePackages = (value: string): string[] =>
     .map((item) => item.trim())
     .filter(Boolean);
 
-const CondaEnvModal = ({ open, onClose, onSubmit }: CondaEnvModalProps) => {
+const CondaEnvModal = ({
+  open,
+  onClose,
+  mode,
+  initialEnv,
+  onSubmit,
+}: CondaEnvModalProps) => {
   const [name, setName] = useState('');
   const [pythonVersion, setPythonVersion] = useState('');
   const [packages, setPackages] = useState('');
+  const [customScript, setCustomScript] = useState('');
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   useEffect(() => {
     if (!open) return;
-    setName('');
-    setPythonVersion('');
-    setPackages('');
+    if (mode === 'edit' && initialEnv) {
+      setName(initialEnv.name);
+      setPythonVersion(initialEnv.python_version);
+      setPackages((initialEnv.packages ?? []).join('\n'));
+      setCustomScript(initialEnv.custom_script ?? '');
+    } else {
+      setName('');
+      setPythonVersion('');
+      setPackages('');
+      setCustomScript('');
+    }
     setErrors({});
-  }, [open]);
+  }, [open, mode, initialEnv]);
 
   const parsedPackages = useMemo(() => parsePackages(packages), [packages]);
 
@@ -46,15 +63,20 @@ const CondaEnvModal = ({ open, onClose, onSubmit }: CondaEnvModalProps) => {
     setErrors({});
 
     const newErrors: Record<string, string> = {};
-    if (!name.trim()) {
-      newErrors.name = 'Name is required';
-    } else if (name.length > 200) {
-      newErrors.name = 'Name must be less than 200 characters';
+    if (mode === 'create') {
+      if (!name.trim()) {
+        newErrors.name = 'Name is required';
+      } else if (name.length > 200) {
+        newErrors.name = 'Name must be less than 200 characters';
+      }
+      if (!pythonVersion.trim()) {
+        newErrors.pythonVersion = 'Python version is required';
+      } else if (pythonVersion.length > 20) {
+        newErrors.pythonVersion = 'Python version must be less than 20 characters';
+      }
     }
-    if (!pythonVersion.trim()) {
-      newErrors.pythonVersion = 'Python version is required';
-    } else if (pythonVersion.length > 20) {
-      newErrors.pythonVersion = 'Python version must be less than 20 characters';
+    if (customScript.length > 2000) {
+      newErrors.customScript = 'Custom script must be less than 2000 characters';
     }
 
     if (Object.keys(newErrors).length > 0) {
@@ -64,11 +86,19 @@ const CondaEnvModal = ({ open, onClose, onSubmit }: CondaEnvModalProps) => {
 
     setIsSubmitting(true);
     try {
-      await onSubmit({
-        name: name.trim(),
-        python_version: pythonVersion.trim(),
-        packages: parsedPackages,
-      });
+      if (mode === 'edit') {
+        await onSubmit({
+          packages: parsedPackages,
+          custom_script: customScript.trim(),
+        });
+      } else {
+        await onSubmit({
+          name: name.trim(),
+          python_version: pythonVersion.trim(),
+          packages: parsedPackages,
+          custom_script: customScript.trim(),
+        });
+      }
     } finally {
       setIsSubmitting(false);
     }
@@ -78,7 +108,9 @@ const CondaEnvModal = ({ open, onClose, onSubmit }: CondaEnvModalProps) => {
     <Dialog open={open} onOpenChange={(isOpen) => !isOpen && onClose()}>
       <DialogContent className="sm:max-w-lg bg-card border-border">
         <DialogHeader>
-          <DialogTitle className="text-lg font-semibold">Create Conda Env</DialogTitle>
+          <DialogTitle className="text-lg font-semibold">
+            {mode === 'edit' ? 'Edit Conda Env' : 'Create Conda Env'}
+          </DialogTitle>
         </DialogHeader>
 
         <form onSubmit={handleSubmit} className="space-y-4">
@@ -89,6 +121,7 @@ const CondaEnvModal = ({ open, onClose, onSubmit }: CondaEnvModalProps) => {
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="e.g. py310-data"
+              disabled={mode === 'edit'}
             />
             {errors.name && (
               <p className="text-xs text-destructive flex items-center gap-1">
@@ -104,6 +137,7 @@ const CondaEnvModal = ({ open, onClose, onSubmit }: CondaEnvModalProps) => {
               value={pythonVersion}
               onChange={(e) => setPythonVersion(e.target.value)}
               placeholder="e.g. 3.10"
+              disabled={mode === 'edit'}
             />
             {errors.pythonVersion && (
               <p className="text-xs text-destructive flex items-center gap-1">
@@ -126,6 +160,22 @@ const CondaEnvModal = ({ open, onClose, onSubmit }: CondaEnvModalProps) => {
             </p>
           </div>
 
+          <div className="space-y-2">
+            <Label htmlFor="conda-env-custom-script">Custom Script (Optional)</Label>
+            <Textarea
+              id="conda-env-custom-script"
+              value={customScript}
+              onChange={(e) => setCustomScript(e.target.value)}
+              placeholder={'echo "setup before package install"'}
+              rows={4}
+            />
+            {errors.customScript && (
+              <p className="text-xs text-destructive flex items-center gap-1">
+                <X className="h-3 w-3" /> {errors.customScript}
+              </p>
+            )}
+          </div>
+
           <div className="flex items-center justify-end gap-2">
             <Button
               type="button"
@@ -136,7 +186,13 @@ const CondaEnvModal = ({ open, onClose, onSubmit }: CondaEnvModalProps) => {
               Cancel
             </Button>
             <Button type="submit" disabled={isSubmitting}>
-              {isSubmitting ? 'Creating...' : 'Create'}
+              {mode === 'edit'
+                ? isSubmitting
+                  ? 'Saving...'
+                  : 'Save'
+                : isSubmitting
+                  ? 'Creating...'
+                  : 'Create'}
             </Button>
           </div>
         </form>

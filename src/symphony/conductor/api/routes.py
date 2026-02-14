@@ -13,6 +13,7 @@ from symphony.conductor.models import (
     CurrentState,
     CondaEnvCreate,
     CondaEnvResponse,
+    CondaEnvUpdate,
     DeploymentCreate,
     DeploymentResponse,
     DeploymentUpdate,
@@ -225,11 +226,28 @@ async def list_conda_envs(
     return await conda_env_store.list(limit=limit, offset=offset)
 
 
+@router_conda_envs.patch("/{env_name}", response_model=CondaEnvResponse)
+async def update_conda_env(env_name: str, payload: CondaEnvUpdate) -> CondaEnvResponse:
+    env = await conda_env_store.update(env_name, payload)
+    if not env:
+        raise HTTPException(status_code=404, detail="Conda env not found")
+    await svc.ensure_envs_on_all_nodes([env], force_recreate=True)
+    return env
+
+
 @router_conda_envs.delete("/{env_name}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_conda_env(env_name: str) -> None:
     ok = await conda_env_store.delete(env_name)
     if not ok:
         raise HTTPException(status_code=404, detail="Conda env not found")
+
+
+@router_conda_envs.post("/{env_name}/rerun", status_code=status.HTTP_202_ACCEPTED)
+async def rerun_conda_env(env_name: str) -> None:
+    env = await conda_env_store.get(env_name)
+    if not env:
+        raise HTTPException(status_code=404, detail="Conda env not found")
+    await svc.ensure_envs_on_all_nodes([env], force_recreate=True)
 
 
 @router_stream.websocket("/ws/updates")

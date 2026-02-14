@@ -377,7 +377,7 @@ class RunnerExec:
         logger.info(
             "Starting exec_id={} cmd={} cwd={} env_keys={}",
             rt.exec_id,
-            cmd,
+            run_cmd,
             cwd,
             list((rt.spec.get("env") or {}).keys()),
         )
@@ -385,12 +385,18 @@ class RunnerExec:
         await rt.append_log("system", f"Starting: {cmd}")
 
         try:
+            spawn_kwargs: Dict[str, Any] = {}
+            if os.name == "posix":
+                # Ensure the workload has an isolated process group so stop/kill
+                # can terminate wrapper processes (e.g. conda run) and children.
+                spawn_kwargs["start_new_session"] = True
             rt.process = await asyncio.create_subprocess_exec(
                 *run_cmd,
                 cwd=cwd,
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **spawn_kwargs,
             )
         except Exception as e:
             rt.status = "CRASHED"
@@ -474,10 +480,7 @@ class RunnerExec:
 
         sig = getattr(signal, stop_signal_name, signal.SIGTERM)
 
-        try:
-            proc.send_signal(sig)
-        except ProcessLookupError:
-            pass
+        self._signal_process(proc, sig)
 
         try:
             await asyncio.wait_for(proc.wait(), timeout=timeout_sec)
@@ -485,10 +488,7 @@ class RunnerExec:
             await rt.append_log(
                 "system", f"Stop timeout after {timeout_sec}s, killing..."
             )
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
+            self._kill_process(proc)
             try:
                 await proc.wait()
             except Exception as e:
@@ -522,6 +522,45 @@ class RunnerExec:
         rt.status = "STOPPED"
 
         await rt.append_log("system", f"Stopped (exit_code={rt.last_exit_code})")
+
+    def _signal_process(self, proc: asyncio.subprocess.Process, sig: signal.Signals) -> None:
+        pid = proc.pid
+        if os.name == "posix" and pid and pid > 0:
+            try:
+                os.killpg(pid, sig)
+                return
+            except ProcessLookupError:
+                return
+            except Exception as exc:
+                logger.debug(
+                    "Failed to signal process group pid={} sig={} err={}",
+                    pid,
+                    sig,
+                    exc,
+                )
+        try:
+            proc.send_signal(sig)
+        except ProcessLookupError:
+            return
+
+    def _kill_process(self, proc: asyncio.subprocess.Process) -> None:
+        pid = proc.pid
+        if os.name == "posix" and pid and pid > 0:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+                return
+            except ProcessLookupError:
+                return
+            except Exception as exc:
+                logger.debug(
+                    "Failed to kill process group pid={} err={}",
+                    pid,
+                    exc,
+                )
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
 
     async def _reconcile_spec_update(
         self, rt: ExecRuntime, *, old_spec: Dict[str, Any], new_spec: Dict[str, Any]
@@ -933,12 +972,19 @@ class RunnerExec:
             await rt.append_log("system", f"wait error: {e!r}")
             return
 
+        exit_reason = ""
         async with rt._state_lock:
+            desired_state = rt.desired_state
+            exit_reason = self._format_exit_reason(
+                code=code,
+                desired_state=desired_state,
+            )
             logger.info(
-                "Exited exec_id={} pid={} code={}",
+                "Exited exec_id={} pid={} code={} reason={}",
                 rt.exec_id,
                 proc.pid,
                 code,
+                exit_reason,
             )
             old_hc_task = rt.hc_task
             rt.last_exit_code = code
@@ -949,7 +995,7 @@ class RunnerExec:
             rt.hc_task = None
             rt.stopped_at_ms = rt._now_ms()
 
-            if rt.desired_state == "RUNNING":
+            if desired_state == "RUNNING":
                 rt.status = "CRASHED" if code != 0 else "EXITED"
             else:
                 rt.status = "STOPPED"
@@ -957,7 +1003,10 @@ class RunnerExec:
         if old_hc_task and not old_hc_task.done():
             old_hc_task.cancel()
 
-        await rt.append_log("system", f"Process exited (code={code})")
+        await rt.append_log(
+            "system",
+            f"Process exited (code={code}, reason={exit_reason})",
+        )
 
         if await self._should_restart(rt, exit_code=code):
             await self._record_restart(rt, reason="auto-restart", exit_code=code)
@@ -976,6 +1025,22 @@ class RunnerExec:
                         backoff_seconds,
                     )
                     await self._spawn(rt)
+
+    def _format_exit_reason(self, *, code: int, desired_state: str) -> str:
+        if code == 0:
+            return "completed"
+        if code < 0:
+            signal_number = -code
+            try:
+                signal_name = signal.Signals(signal_number).name
+            except ValueError:
+                signal_name = f"SIG{signal_number}"
+            if desired_state != "RUNNING":
+                return f"terminated by signal {signal_name} after stop request"
+            return f"terminated by signal {signal_name}"
+        if desired_state != "RUNNING":
+            return "non-zero exit after stop request"
+        return "non-zero exit status"
 
     async def _should_restart(self, rt: ExecRuntime, *, exit_code: int) -> bool:
         async with rt._state_lock:
@@ -1255,11 +1320,9 @@ class RunnerExec:
         if not env_name:
             return cmd
 
-        quoted_env_name = shlex.quote(env_name)
-        quoted_cmd = " ".join(shlex.quote(part) for part in cmd)
-        shell_cmd = (
-            "eval \"$(conda shell.bash hook)\" "
-            f"&& conda activate {quoted_env_name} "
-            f"&& exec {quoted_cmd}"
-        )
-        return ["bash", "-lc", shell_cmd]
+        conda_path = self._get_conda_path()
+        return [conda_path, "run", "--no-capture-output", "-n", env_name, *cmd]
+
+    def _get_conda_path(self) -> str:
+        conda_path = str(os.getenv("CONDA_PATH", "conda") or "").strip()
+        return conda_path or "conda"

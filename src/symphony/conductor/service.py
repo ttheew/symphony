@@ -13,6 +13,8 @@ from symphony.conductor import conda_env_store
 from symphony.conductor.node_registry import NodeAlreadyRegisteredError, NodeRegistry
 from symphony.v1 import protocol_pb2, protocol_pb2_grpc
 
+FORCE_RECREATE_MARKER = "__SYMPHONY_FORCE_RECREATE__"
+
 
 class ConductorService(protocol_pb2_grpc.ConductorServiceServicer):
     _instance: Optional[ConductorService] = None
@@ -204,7 +206,7 @@ class ConductorService(protocol_pb2_grpc.ConductorServiceServicer):
         else:
             await self._out_msg_queue[node_id].put(message)
 
-    async def ensure_envs_on_all_nodes(self, envs) -> None:
+    async def ensure_envs_on_all_nodes(self, envs, *, force_recreate: bool = False) -> None:
         if not envs:
             return
         snapshot = await self._registry.snapshot_records()
@@ -218,6 +220,11 @@ class ConductorService(protocol_pb2_grpc.ConductorServiceServicer):
                                 name=env.name,
                                 python_version=env.python_version,
                                 packages=list(env.packages or []),
+                                custom_script=(
+                                    f"{FORCE_RECREATE_MARKER}\n{env.custom_script or ''}"
+                                    if force_recreate
+                                    else (env.custom_script or "")
+                                ),
                             )
                             for env in envs
                         ]
@@ -367,6 +374,7 @@ class ConductorService(protocol_pb2_grpc.ConductorServiceServicer):
                             name=env.name,
                             python_version=env.python_version,
                             packages=list(env.packages or []),
+                            custom_script=env.custom_script or "",
                         )
                         for env in missing
                     ]

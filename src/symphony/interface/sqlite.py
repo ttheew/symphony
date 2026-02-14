@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS conda_envs (
     python_version  TEXT NOT NULL,
     packages        JSON NOT NULL
         CHECK (json_valid(packages)),
+    custom_script   TEXT NOT NULL DEFAULT '',
     created_at_ms   INTEGER NOT NULL,
     updated_at_ms   INTEGER NOT NULL
 );
@@ -100,9 +101,19 @@ class SQLiteAsyncDB:
             await self._conn.execute(sql)
 
         await self._conn.execute(CREATE_CONDA_ENVS_TABLE_SQL)
+        await self._ensure_conda_envs_columns()
 
         for sql in CREATE_CONDA_ENVS_INDEXES_SQL:
             await self._conn.execute(sql)
+
+    async def _ensure_conda_envs_columns(self) -> None:
+        async with self._conn.execute("PRAGMA table_info(conda_envs)") as cur:
+            rows = await cur.fetchall()
+        existing = {str(row[1]) for row in rows}
+        if "custom_script" not in existing:
+            await self._conn.execute(
+                "ALTER TABLE conda_envs ADD COLUMN custom_script TEXT NOT NULL DEFAULT ''"
+            )
 
     async def close(self) -> None:
         self._closed = True

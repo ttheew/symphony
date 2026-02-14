@@ -1,5 +1,3 @@
-import asyncio
-
 from loguru import logger
 
 from symphony.config import AppConfig
@@ -11,6 +9,6 @@ async def run_node(cfg: AppConfig) -> None:
     logger.info("Node starting id={}", cfg.node.node_id)
     try:
         await agent.start()
-    except asyncio.CancelledError:
+    finally:
         logger.info("Node shutting down...")
         await agent.stop()

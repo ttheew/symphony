@@ -23,6 +23,8 @@ class NodeAgent:
     def __init__(self, cfg: NodeConfig) -> None:
         self._cfg = cfg
         self._stopped = asyncio.Event()
+        self._stop_lock = asyncio.Lock()
+        self._stop_done = False
         self.r_monitor = Monitor(
             mount_points=["/"], sample_interval=1.0, space_interval=10.0
         )
@@ -155,7 +157,34 @@ class NodeAgent:
                     continue
 
     async def stop(self) -> None:
-        self._stopped.set()
+        async with self._stop_lock:
+            if self._stop_done:
+                return
+            self._stop_done = True
+            self._stopped.set()
+
+            deployment_ids = await self.runner_exec.list_ids()
+            if deployment_ids:
+                logger.info(
+                    "Stopping {} deployment(s) during node shutdown",
+                    len(deployment_ids),
+                )
+                results = await asyncio.gather(
+                    *(self.runner_exec.stop(deployment_id) for deployment_id in deployment_ids),
+                    return_exceptions=True,
+                )
+                for deployment_id, result in zip(deployment_ids, results):
+                    if isinstance(result, Exception):
+                        logger.warning(
+                            "Failed to stop deployment during shutdown deployment_id={} err={}",
+                            deployment_id,
+                            result,
+                        )
+
+            try:
+                self.r_monitor.stop()
+            except Exception as exc:
+                logger.warning("Failed to stop resource monitor cleanly: {}", exc)
 
     async def _build_deployment_status(self):
         deployment_ids = await self.runner_exec.list_ids()
